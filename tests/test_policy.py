@@ -55,7 +55,9 @@ def test_a_superusers_visit_reads_only():
     "actor, target, allowed",
     [
         ("super_admin", "admin", True),
-        ("admin", "admin", False),  # strict: never your own rank
+        ("admin", "admin", True),  # owner 2026-11-13: admin is exempt from the same-rank rule
+        ("admin", "super_admin", False),
+        ("Admin", "admin", True),
         ("admin", "accountant", True),
         ("accountant", "accountant", False),
         ("accountant", "shop_manager", True),
@@ -64,12 +66,13 @@ def test_a_superusers_visit_reads_only():
         ("cashier", "entity_base", False),  # below shop manager manages nobody
     ],
 )
-def test_you_manage_only_roles_below_yours(actor, target, allowed):
+def test_you_manage_only_roles_below_yours_admin_excepted(actor, target, allowed):
     assert can_manage_role_assignment(actor, target) is allowed
 
 
 def test_the_roles_an_actor_may_give():
     assert assignable_roles("super_admin") == ["admin", "accountant", "shop_manager", "cashier"]
-    assert assignable_roles("admin") == ["accountant", "shop_manager", "cashier"]
+    assert assignable_roles("admin") == ["admin", "accountant", "shop_manager", "cashier"]
+    assert assignable_roles("accountant") == ["shop_manager", "cashier"]
     assert assignable_roles("shop_manager") == ["cashier"]
     assert assignable_roles("cashier") == []

@@ -8,8 +8,9 @@ but nothing reads them; who may do what is decided here, from the ladder and ``P
 SUPERUSER READ-ONLY. A system superuser reaches any company without a membership, but there only
 the views in ``READONLY_ALLOWED_PERMISSIONS`` pass; every write is refused.
 
-STRICT ROLE MANAGEMENT (owner, 2026-11-12). You manage only roles BELOW your own: an admin cannot
-invite, re-role or remove another admin (a super_admin can); a shop manager manages cashiers.
+STRICT ROLE MANAGEMENT (owner, 2026-11-12). You manage only roles BELOW your own: an accountant
+manages shop managers and cashiers, a shop manager cashiers. Admin is exempt (owner, 2026-11-13):
+an admin invites, re-roles and removes admins too, never a super_admin.
 """
 
 from __future__ import annotations
@@ -175,14 +176,18 @@ def role_allows(role: Any, permission: Permission) -> bool:
 
 def can_manage_role_assignment(actor_role: Any, target_role: Any) -> bool:
     """Strict (owner, 2026-11-12): you act only on a role below your own, and only from shop
-    manager up. Invite, cancel or resend an invite, change a role, remove a member."""
+    manager up. Invite, cancel or resend an invite, change a role, remove a member.
+    Admin is the exception (owner, 2026-11-13): an admin also manages admins, themselves included;
+    the services' own guards keep the only admin and the payer. Never a super_admin."""
     if not role_at_least(actor_role, Role.SHOP_MANAGER.value):
         return False
+    if normalize_role(actor_role) == Role.ADMIN.value:
+        return rank(target_role) <= rank(Role.ADMIN.value)
     return rank(actor_role) > rank(target_role)
 
 
 def assignable_roles(actor_role: Any) -> list[str]:
-    """The roles an actor may give, highest first: those below their own, from cashier up (a
+    """The roles an actor may give, highest first: those below their own (an admin's own too), from cashier up (a
     super_admin is never given; nor is entity_base, which is no role at all)."""
     offered = [Role.ADMIN, Role.ACCOUNTANT, Role.SHOP_MANAGER, Role.CASHIER]
     return [r.value for r in offered if can_manage_role_assignment(actor_role, r.value)]
