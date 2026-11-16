@@ -79,7 +79,7 @@ engine log through, so their messages stay byte-identical.
 Pin a tag in `requirements.txt` (tags are **immutable**: a change is a new tag):
 
 ```
-minty-shared[jwt,django,testing] @ https://github.com/minty-oliveandvine/minty-shared-py/archive/refs/tags/v0.2.tar.gz
+minty-shared[jwt,django,testing] @ https://github.com/minty-live/minty-shared-py/archive/refs/tags/v0.2.tar.gz
 ```
 
 A Django API takes all three extras; Flask takes `[jwt]`.

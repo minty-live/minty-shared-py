@@ -1,6 +1,6 @@
 # Lint, types and the unit tests.
 #
-# NOT a call into minty-oliveandvine/.github, unlike every app repo: a library has no service to
+# NOT a call into minty-live/.github, unlike every app repo: a library has no service to
 # boot or schema to build, and a reusable workflow with one caller is not shared CI (the same
 # judgement minty-shared-ts makes). The day a second Python package (minty-db) exists, this
 # becomes `py-package.yml` in that repo. Recorded in Minty/docs/features/ci.md.
