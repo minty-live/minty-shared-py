@@ -53,3 +53,24 @@ def test_load_harness_says_where_it_looked(monkeypatch, tmp_path):
     monkeypatch.setenv("MINTY_REPO", str(tmp_path))
     with pytest.raises(RuntimeError, match="set MINTY_REPO"):
         pg.load_harness()
+
+
+def test_the_sessions_plugin_fakes_the_touch_and_starts_each_test_empty(pytester):
+    pytester.makeconftest('pytest_plugins = ["minty_shared.testing.sessions"]\n')
+    pytester.makepyfile(
+        """
+        from minty_shared import tokens
+
+        def test_alive_until_ended(hub_sessions):
+            assert tokens.session_alive("s1", "https://a.test", "k") is True
+            hub_sessions.end("s2")
+            assert tokens.session_alive("s2", "https://a.test", "k") is False
+            assert hub_sessions.calls == ["s1", "s2"]
+
+        def test_the_cache_was_forgotten(hub_sessions):
+            tokens.session_alive("s1", "https://a.test", "k")
+            assert hub_sessions.calls == ["s1"]
+        """
+    )
+    result = pytester.runpytest_subprocess("-p", "no:cacheprovider", "-p", "no:django")
+    result.assert_outcomes(passed=2)

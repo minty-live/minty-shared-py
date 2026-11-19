@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "minty-shared"
-version = "0.7.0"
+version = "0.8.0"
 description = "Minty's shared Python for every backend: logging, config, money, time, tokens, storage, document reading (AI), the roles and permissions, the account rules, and the Django error envelope."
 requires-python = ">=3.13"
 # tzdata: minty_shared.time needs the IANA database, which Windows does not have and a slim
@@ -41,6 +41,8 @@ testpaths = ["tests"]
 # pytest-django (the testing extra) runs the minty_shared.django tests against tests/djangoapp.
 DJANGO_SETTINGS_MODULE = "tests.djangoapp.settings"
 pythonpath = ["."]
+# pytester: the minty_shared.testing.sessions plugin is run in a pytest of its own.
+addopts = ["-p", "pytester"]
 
 [tool.ruff]
 line-length = 100
