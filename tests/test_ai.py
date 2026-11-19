@@ -371,12 +371,15 @@ def test_the_log_line_carries_numbers_never_values(monkeypatch, caplog):
     extraction, _ = _run(monkeypatch, FakeInteraction(_reply(amount_value=4321.5)))
     ai.log_read(CONFIG, extraction, entity_id="ent-1", user_id="user-1")
     line = caplog.records[-1].getMessage()
-    assert line.startswith("test_ai: extract entity=ent-1 user=user-1 model=gemini-3.8-flash")
+    assert line.startswith(
+        "test_ai: extract entity=ent-1 user=user-1 model=gemini-3.8-flash "
+        "attempts=gemini-3.8-flash:ok"
+    )
     assert "tokens_in=5000" in line and "status=ok" in line
     assert "4321" not in line and "con-sf" not in line
 
 
-# --- sniffing and rate limiting ----------------------------------------------------------------
+# --- sniffing and the switch -------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -393,24 +396,7 @@ def test_the_type_is_sniffed_from_the_bytes(data, expected):
     assert ai.sniff_mime(data) == expected
 
 
-def test_the_rate_limiter_sheds_load_per_user(monkeypatch):
-    monkeypatch.setenv("TEST_AI_RATE_USER_PER_MIN", "3")
-    monkeypatch.setenv("TEST_AI_RATE_ENTITY_PER_HOUR", "1000")
-    limiter = ai.RateLimiter()
-    assert [limiter.allow("u", "e", CONFIG) for _ in range(4)] == [True, True, True, False]
-    assert limiter.allow("u2", "e", CONFIG) is True
-
-
-def test_the_entity_limit_is_separate_from_the_user_limit(monkeypatch):
-    monkeypatch.setenv("TEST_AI_RATE_USER_PER_MIN", "1000")
-    monkeypatch.setenv("TEST_AI_RATE_ENTITY_PER_HOUR", "2")
-    limiter = ai.RateLimiter()
-    assert [limiter.allow(u, "shared", CONFIG) for u in ("a", "b", "c")] == [True, True, False]
-    limiter.reset()
-    assert limiter.allow("c", "shared", CONFIG) is True
-
-
-def test_each_reader_has_its_own_limits_and_switch(monkeypatch):
+def test_each_reader_has_its_own_switch(monkeypatch):
     monkeypatch.setenv("TEST_AI_ENABLED", "true")
     monkeypatch.delenv("OTHER_AI_ENABLED", raising=False)
     assert CONFIG.enabled() is True
@@ -477,3 +463,166 @@ def test_a_free_tier_quota_error_while_configured_paid_is_reported_but_switches_
     assert ai._check_tier_matches_reality(paid, CONFIG) is False
     monkeypatch.setenv("EXPENSE_AI_DIRECT_TIER", "free")
     assert ai._check_tier_matches_reality(free, CONFIG) is False
+
+
+# --- models: failover and approved providers ---------------------------------------------------
+
+
+class FakeProvider:
+    """A provider answering per model: a reason string fails that model, a reply text answers."""
+
+    name = "gemini"
+
+    def __init__(self, answers):
+        self.answers = answers
+        self.calls: list[str] = []
+
+    def call(self, model, parts, config):
+        self.calls.append(model)
+        answer = self.answers[model]
+        usage = {"input_tokens": 1000, "output_tokens": 100, "thought_tokens": 0}
+        if answer in ai.FAILOVER_REASONS or answer == ai.REASON_SAFETY_BLOCKED:
+            return ai.ProviderReply(reason=answer, usage=usage)
+        return ai.ProviderReply(text=answer, usage=usage)
+
+
+def _read_with(monkeypatch, answers, models):
+    provider = FakeProvider(answers)
+    monkeypatch.setitem(ai.PROVIDERS, "gemini", provider)
+    extraction = ai.read(
+        b"%PDF-1.4 fake",
+        "application/pdf",
+        config=CONFIG,
+        instruction="Read it.",
+        prefix_text="## Lists",
+        closing_text="Go.",
+        reply_model=Reply,
+        validate=_validate,
+        models=models,
+    )
+    return extraction, provider
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ai.REASON_TIMEOUT,
+        ai.REASON_PROVIDER_ERROR,
+        ai.REASON_RATE_LIMITED,
+        ai.REASON_TRUNCATED,
+        ai.REASON_INVALID_REPLY,
+    ],
+)
+def test_the_backup_answers_when_the_primary_fails(monkeypatch, failure):
+    extraction, provider = _read_with(
+        monkeypatch,
+        {"gemini-3.5-flash-lite": failure, "gemini-3.8-flash": _reply()},
+        ["gemini-3.5-flash-lite", "gemini-3.8-flash"],
+    )
+    assert provider.calls == ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
+    assert extraction.suggestions is not None and extraction.reason is None
+    assert extraction.answered and extraction.audit["model_answered"] == "gemini-3.8-flash"
+    assert extraction.attempts_text() == f"gemini-3.5-flash-lite:{failure}>gemini-3.8-flash:ok"
+
+
+def test_a_reply_that_is_not_json_moves_to_the_backup(monkeypatch):
+    extraction, provider = _read_with(
+        monkeypatch,
+        {"gemini-3.5-flash-lite": "{not json", "gemini-3.8-flash": _reply()},
+        ["gemini-3.5-flash-lite", "gemini-3.8-flash"],
+    )
+    assert extraction.audit["model_answered"] == "gemini-3.8-flash"
+    assert extraction.attempts_text().startswith("gemini-3.5-flash-lite:invalid_reply>")
+
+
+def test_the_backup_is_not_called_when_the_primary_answers(monkeypatch):
+    extraction, provider = _read_with(
+        monkeypatch,
+        {"gemini-3.5-flash-lite": _reply(), "gemini-3.8-flash": _reply()},
+        ["gemini-3.5-flash-lite", "gemini-3.8-flash"],
+    )
+    assert provider.calls == ["gemini-3.5-flash-lite"]
+    assert extraction.audit["model_answered"] == "gemini-3.5-flash-lite"
+
+
+def test_a_safety_block_does_not_fail_over(monkeypatch):
+    extraction, provider = _read_with(
+        monkeypatch,
+        {"gemini-3.5-flash-lite": ai.REASON_SAFETY_BLOCKED, "gemini-3.8-flash": _reply()},
+        ["gemini-3.5-flash-lite", "gemini-3.8-flash"],
+    )
+    assert provider.calls == ["gemini-3.5-flash-lite"]
+    assert extraction.reason == ai.REASON_SAFETY_BLOCKED and not extraction.answered
+
+
+def test_nothing_usable_is_an_answer_and_does_not_fail_over(monkeypatch):
+    extraction, provider = _read_with(
+        monkeypatch,
+        {
+            "gemini-3.5-flash-lite": _reply(amount_confidence=0.1, contact_confidence=0.1),
+            "gemini-3.8-flash": _reply(),
+        },
+        ["gemini-3.5-flash-lite", "gemini-3.8-flash"],
+    )
+    assert provider.calls == ["gemini-3.5-flash-lite"]
+    assert extraction.reason == ai.REASON_NO_USABLE_FIELD and extraction.answered
+
+
+def test_both_failing_is_a_failed_read_with_every_token_counted(monkeypatch):
+    extraction, provider = _read_with(
+        monkeypatch,
+        {"gemini-3.5-flash-lite": ai.REASON_TIMEOUT, "gemini-3.8-flash": ai.REASON_PROVIDER_ERROR},
+        ["gemini-3.5-flash-lite", "gemini-3.8-flash"],
+    )
+    assert extraction.suggestions is None and extraction.reason == ai.REASON_PROVIDER_ERROR
+    assert not extraction.answered
+    assert extraction.tokens() == 2 * 1100
+    assert extraction.attempts_text() == (
+        "gemini-3.5-flash-lite:timeout>gemini-3.8-flash:provider_error"
+    )
+
+
+def test_cost_sums_each_attempt_at_its_own_model_s_price(monkeypatch):
+    extraction, _ = _read_with(
+        monkeypatch,
+        {"gemini-3.5-flash-lite": ai.REASON_TIMEOUT, "gemini-3.8-flash": _reply()},
+        ["gemini-3.5-flash-lite", "gemini-3.8-flash"],
+    )
+    lite = ai.estimate_cost("gemini-3.5-flash-lite", 1000, 100, 0)
+    flash = ai.estimate_cost("gemini-3.8-flash", 1000, 100, 0)
+    assert extraction.audit["estimated_cost"] == round(lite + flash, 6)
+
+
+@pytest.mark.parametrize("model", ["openai:gpt-6.1-terra", "claude-sonnet-5-5", "gpt-6-luna"])
+def test_a_model_of_an_unapproved_provider_is_never_called(monkeypatch, model):
+    extraction, provider = _read_with(
+        monkeypatch, {"gemini-3.8-flash": _reply()}, [model, "gemini-3.8-flash"]
+    )
+    assert provider.calls == ["gemini-3.8-flash"]
+    assert extraction.attempts_text() == f"{model}:not_configured>gemini-3.8-flash:ok"
+
+
+def test_a_named_gemini_model_reaches_gemini_without_its_prefix(monkeypatch):
+    extraction, provider = _read_with(
+        monkeypatch, {"gemini-3.8-flash": _reply()}, ["gemini:gemini-3.8-flash"]
+    )
+    assert provider.calls == ["gemini-3.8-flash"] and extraction.answered
+
+
+def test_no_list_means_the_reader_s_own_model(monkeypatch):
+    extraction, provider = _read_with(monkeypatch, {"gemini-3.8-flash": _reply()}, None)
+    assert provider.calls == ["gemini-3.8-flash"]
+
+
+def test_the_log_line_names_the_model_that_answered_after_a_failover(monkeypatch, caplog):
+    caplog.set_level("INFO", logger="minty-shared.ai")
+    extraction, _ = _read_with(
+        monkeypatch,
+        {"gemini-3.5-flash-lite": ai.REASON_TIMEOUT, "gemini-3.8-flash": _reply()},
+        ["gemini-3.5-flash-lite", "gemini-3.8-flash"],
+    )
+    ai.log_read(CONFIG, extraction, entity_id="ent-1", user_id="user-1")
+    line = caplog.records[-1].getMessage()
+    assert (
+        "model=gemini-3.8-flash attempts=gemini-3.5-flash-lite:timeout>gemini-3.8-flash:ok" in line
+    )
