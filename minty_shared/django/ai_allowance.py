@@ -3,7 +3,12 @@ GRANTS, Petty Cash and Payment Request together, all held in the database so the
 UPDATE (or a command), never a release.
 
 ``ai_policy`` (one row) holds the models every read tries - ``primary_model``, then
-``backup_model`` - and two allowance settings:
+``backup_model`` - the readers' settings (owner, 2026-11-20; once each service's environment):
+``receipt_reader_on`` and ``invoice_reader_on`` (Petty Cash's and Payment Request's switches),
+``timeout_s``, ``max_output_tokens``, ``thinking_level``, ``max_file_mb`` and ``location`` (the
+Vertex AI region), which
+``Policy.reader`` turns into the ``minty_shared.ai.ReaderConfig`` a read uses - and two allowance
+settings:
 
 * ``default_grant`` - the one-time grant every company is given on its first read: ``{"tokens": n,
   "reads": n, "days": n}``, each key optional (at least ``tokens`` or ``reads``; ``days`` = it
@@ -41,6 +46,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -52,11 +58,18 @@ from django.db import connection, transaction
 from django.db.models import Count, F, Min, Q, Sum
 from django.utils import timezone
 
+from minty_shared import ai
+
 logger = logging.getLogger("minty-shared.ai")
 
 MODULE_PETTY_CASH = "petty_cash"
 MODULE_PAYMENT_REQUEST = "payment_request"
 MODULES = (MODULE_PETTY_CASH, MODULE_PAYMENT_REQUEST)
+
+#: The two readers, by their ``ai_policy`` switch: Petty Cash's receipts, Payment Request's invoices.
+READER_RECEIPT = "receipt"
+READER_INVOICE = "invoice"
+READERS = (READER_RECEIPT, READER_INVOICE)
 
 #: A reserved read still counts while it may be in flight: two model calls of at most ~25 s each.
 PENDING_COUNTS_FOR = timedelta(minutes=5)
@@ -86,16 +99,56 @@ class GrantSpec:
 
 
 @dataclass(frozen=True)
+class ReaderSettings:
+    """``ai_policy``'s reader columns. The defaults are the columns' own."""
+
+    receipt_reader_on: bool = False
+    invoice_reader_on: bool = False
+    timeout_s: int = 25
+    max_output_tokens: int = 4096
+    thinking_level: str = "low"
+    max_file_mb: int = 10
+    location: str = "asia-southeast1"
+
+
+#: The reader columns, in order - what ``load_policy`` reads and ``parse_settings`` accepts.
+SETTING_FIELDS = tuple(ReaderSettings.__dataclass_fields__)
+
+#: Each number's allowed range - the columns' CHECKs, so a bad value is named before the database
+#: refuses it.
+SETTING_RANGES = {"timeout_s": (5, 120), "max_output_tokens": (256, 65536), "max_file_mb": (1, 20)}
+
+#: A Vertex AI region's shape - ``ck_ai_policy_location``.
+_LOCATION = re.compile(r"[a-z][a-z0-9-]*[a-z0-9]")
+
+
+@dataclass(frozen=True)
 class Policy:
     primary_model: str
     backup_model: str | None
     rules: tuple[Rule, ...]
     default_grant: GrantSpec | None = None
+    settings: ReaderSettings = ReaderSettings()
 
     @property
     def models(self) -> list[str]:
         """The models a read tries, in order."""
         return [self.primary_model] + ([self.backup_model] if self.backup_model else [])
+
+    def reader(self, name: str) -> ai.ReaderConfig:
+        """``name``'s (``READER_RECEIPT`` / ``READER_INVOICE``) settings for ``minty_shared.ai``."""
+        if name not in READERS:
+            raise ValueError(f"unknown reader {name!r}")
+        s = self.settings
+        return ai.ReaderConfig(
+            label=f"{name}_ai",
+            enabled=s.receipt_reader_on if name == READER_RECEIPT else s.invoice_reader_on,
+            timeout_seconds=s.timeout_s,
+            max_output_tokens=s.max_output_tokens,
+            thinking_level=s.thinking_level,
+            max_file_mb=s.max_file_mb,
+            location=s.location,
+        )
 
 
 @dataclass(frozen=True)
@@ -208,8 +261,48 @@ def parse_grant(raw: Any, where: str = "default_grant") -> GrantSpec | None:
     )
 
 
+def parse_settings(raw: dict[str, Any] | None) -> ReaderSettings:
+    """``ai_policy``'s reader columns as ``ReaderSettings``, or ``PolicyError``. A key not given
+    keeps the column's default."""
+    raw = dict(raw or {})
+    unknown = set(raw) - set(SETTING_FIELDS)
+    if unknown:
+        raise PolicyError(f"unknown reader settings {sorted(unknown)}")
+    values: dict[str, Any] = {}
+    for key in ("receipt_reader_on", "invoice_reader_on"):
+        if key in raw:
+            if not isinstance(raw[key], bool):
+                raise PolicyError(f"{key} must be true or false, not {raw[key]!r}")
+            values[key] = raw[key]
+    for key, (low, high) in SETTING_RANGES.items():
+        if key in raw:
+            value = _whole(raw[key], key, low)
+            if value > high:
+                raise PolicyError(f"{key} must be at most {high}, not {value}")
+            values[key] = value
+    if "thinking_level" in raw:
+        level = raw["thinking_level"]
+        if level not in ai.THINKING_LEVELS:
+            raise PolicyError(
+                f"thinking_level must be one of {', '.join(ai.THINKING_LEVELS)}, not {level!r}"
+            )
+        values["thinking_level"] = level
+    if "location" in raw:
+        region = raw["location"]
+        if not isinstance(region, str) or not _LOCATION.fullmatch(region) or len(region) > 40:
+            raise PolicyError(
+                f"location must be a Vertex AI region like asia-southeast1, not {region!r}"
+            )
+        values["location"] = region
+    return ReaderSettings(**values)
+
+
 def parse_policy(
-    primary_model: Any, backup_model: Any, limit_rules: Any, default_grant: Any = None
+    primary_model: Any,
+    backup_model: Any,
+    limit_rules: Any,
+    default_grant: Any = None,
+    settings: dict[str, Any] | None = None,
 ) -> Policy:
     if not isinstance(primary_model, str) or not primary_model.strip():
         raise PolicyError("primary_model is empty")
@@ -217,7 +310,11 @@ def parse_policy(
         backup_model.strip() if isinstance(backup_model, str) and backup_model.strip() else None
     )
     return Policy(
-        primary_model.strip(), backup, parse_rules(limit_rules), parse_grant(default_grant)
+        primary_model.strip(),
+        backup,
+        parse_rules(limit_rules),
+        parse_grant(default_grant),
+        parse_settings(settings),
     )
 
 
@@ -227,7 +324,7 @@ def load_policy() -> Policy | None:
     row = (
         apps.get_model("minty_db", "AiPolicy")
         .objects.filter(id=1)
-        .values("primary_model", "backup_model", "limit_rules", "default_grant")
+        .values("primary_model", "backup_model", "limit_rules", "default_grant", *SETTING_FIELDS)
         .first()
     )
     if row is None:
@@ -238,7 +335,11 @@ def load_policy() -> Policy | None:
         return None
     try:
         return parse_policy(
-            row["primary_model"], row["backup_model"], row["limit_rules"], row["default_grant"]
+            row["primary_model"],
+            row["backup_model"],
+            row["limit_rules"],
+            row["default_grant"],
+            {key: row[key] for key in SETTING_FIELDS},
         )
     except PolicyError as exc:
         logger.error("ai: ai_policy is unusable (%s) - AI reading is OFF until it is fixed", exc)
@@ -414,13 +515,11 @@ def status(entity_id: Any, policy: Policy) -> Allowance:
     return summarise(policy.rules, [by_period[r.period_days] for r in policy.rules], grants, now)
 
 
-def reader_status(enabled: bool, entity_id: Any) -> dict[str, Any]:
-    """What a page needs to draw the read button: ``enabled`` (the reader's switch AND a usable
-    policy) and the allowance. A switched-off reader sends no numbers."""
-    if not enabled:
-        return {"enabled": False}
+def reader_status(reader: str, entity_id: Any) -> dict[str, Any]:
+    """What a page needs to draw the read button: ``enabled`` (a usable policy AND ``reader``'s
+    switch in it) and the allowance. A switched-off reader sends no numbers."""
     policy = load_policy()
-    if policy is None:
+    if policy is None or not policy.reader(reader).enabled:
         return {"enabled": False}
     return {"enabled": True, **status(entity_id, policy).as_dict()}
 

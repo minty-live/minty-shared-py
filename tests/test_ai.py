@@ -1,6 +1,7 @@
 """minty_shared.ai: the engine every document reader shares. Lifted with the generic cases of
 Flask's tests/test_expense_ai.py (2026-11-04); each reader keeps its own tests for its prompt,
-context and the check of the reply against the lists it sent.
+context and the check of the reply against the lists it sent. Since 2026-11-20 the route is Vertex
+AI's ``models.generate_content`` only, and a reader's settings come from ``ai_policy``.
 
 No network: the client is a stand-in throughout - a test that reached Google would test Google.
 """
@@ -8,23 +9,24 @@ No network: the client is a stand-in throughout - a test that reached Google wou
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
 pytest.importorskip("pydantic")
+pytest.importorskip("google.genai")
 
 from pydantic import BaseModel  # noqa: E402
 
 from minty_shared import ai  # noqa: E402
 
-CONFIG = ai.ReaderConfig("TEST_AI")
+CONFIG = ai.ReaderConfig(label="test_ai", enabled=True)
+MODELS = ["gemini-3.8-flash"]
 
 
 class Reply(BaseModel):
     amount_value: float = 0.0
-    amount_confidence: float = 0.0
     contact_id: str = ""
-    contact_confidence: float = 0.0
 
 
 SENT_CONTACTS = {"con-sf"}
@@ -33,46 +35,46 @@ SENT_CONTACTS = {"con-sf"}
 def _validate(parsed: Reply) -> dict:
     contact = parsed.contact_id if parsed.contact_id in SENT_CONTACTS else ""
     amount = parsed.amount_value if 0 < parsed.amount_value <= 10_000_000 else ""
-    return {
-        "amount": ai.field(amount, parsed.amount_confidence, CONFIG),
-        "contact": ai.field(contact, parsed.contact_confidence if contact else 0, CONFIG),
-    }
+    return {"amount": ai.checked(amount), "contact": ai.checked(contact)}
 
 
 def _reply(**over) -> str:
-    body = {
-        "amount_value": 120.0,
-        "amount_confidence": 0.97,
-        "contact_id": "con-sf",
-        "contact_confidence": 0.9,
-    }
+    body = {"amount_value": 120.0, "contact_id": "con-sf"}
     body.update(over)
     return json.dumps(body)
 
 
 class FakeUsage:
-    total_input_tokens = 5000
-    total_output_tokens = 300
-    total_thought_tokens = 400
-    total_cached_tokens = 0
+    prompt_token_count = 5000
+    candidates_token_count = 300
+    thoughts_token_count = 400
+    cached_content_token_count = 0
 
 
-class FakeInteraction:
-    def __init__(self, output_text=None, status="completed", errors=None):
-        self.id = "interaction-1"
-        self.output_text = output_text
-        self.status = status
-        self.errors = errors or []
-        self.usage = FakeUsage()
+class FakeResponse:
+    """A ``GenerateContentResponse`` in the shape the engine reads: one candidate whose parts are
+    the model's thinking (if any) then its reply, or a prompt blocked before any candidate."""
+
+    def __init__(self, text=None, finish="STOP", block=None, thought=None, candidates=True):
+        self.response_id = "response-1"
+        self.usage_metadata = FakeUsage()
+        self.prompt_feedback = SimpleNamespace(block_reason=block) if block else None
+        parts = [SimpleNamespace(text=thought, thought=True)] if thought else []
+        if text is not None:
+            parts.append(SimpleNamespace(text=text, thought=None))
+        content = SimpleNamespace(parts=parts)
+        self.candidates = (
+            [SimpleNamespace(finish_reason=finish, content=content)] if candidates else []
+        )
 
 
-class FakeInteractions:
+class FakeModels:
     def __init__(self, result):
         self._result = result
         self.calls = 0
         self.last_request = None
 
-    def create(self, **kwargs):
+    def generate_content(self, **kwargs):
         self.calls += 1
         self.last_request = kwargs
         if isinstance(self._result, Exception):
@@ -84,122 +86,105 @@ class FakeInteractions:
 
 class FakeClient:
     def __init__(self, result):
-        self.interactions = FakeInteractions(result)
+        self.models = FakeModels(result)
 
 
 @pytest.fixture(autouse=True)
 def _settings(monkeypatch):
-    monkeypatch.setenv("TEST_AI_CONF_HIGH", "0.85")
-    monkeypatch.setenv("TEST_AI_CONF_MEDIUM", "0.60")
-    monkeypatch.setenv("TEST_AI_MODEL", "gemini-3.8-flash")
     monkeypatch.setattr(ai.time, "sleep", lambda _s: None)
     ai.reset_client()
     yield
     ai.reset_client()
 
 
-def _run(monkeypatch, result):
+def _run(monkeypatch, result, config=CONFIG, document=b"%PDF-1.4 fake", mime="application/pdf"):
     client = FakeClient(result)
-    monkeypatch.setattr(ai, "get_client", lambda timeout_s: client)
+    monkeypatch.setattr(ai, "get_client", lambda timeout_s, region: client)
     extraction = ai.read(
-        b"%PDF-1.4 fake",
-        "application/pdf",
-        config=CONFIG,
+        document,
+        mime,
+        config=config,
         instruction="Read it.",
         prefix_text="## Lists",
         closing_text="Go.",
         reply_model=Reply,
         validate=_validate,
+        models=MODELS,
     )
     return extraction, client
 
 
-def _status_error(klass, status, message):
-    """A real SDK status error: ``interactions.create`` raises ``google.genai._gaos...
-    compat_errors``, NOT the legacy ``google.genai.errors`` family."""
-    import httpx
+def _api_error(code, message):
+    """A real SDK status error: ``generate_content`` raises ``google.genai.errors``' ClientError
+    (4xx) or ServerError (5xx), each carrying ``.code``."""
+    from google.genai import errors
 
-    request = httpx.Request("POST", "https://generativelanguage.googleapis.com/x")
-    return klass(message, response=httpx.Response(status, request=request), body=None)
-
-
-def _compat():
-    pytest.importorskip("google.genai")
-    from google.genai._gaos.lib import compat_errors
-
-    return compat_errors
+    body = {"error": {"code": code, "message": message, "status": "X"}}
+    return (errors.ClientError if code < 500 else errors.ServerError)(code, body)
 
 
 # --- the request ---------------------------------------------------------------------------------
 
 
-def test_a_good_reply_is_validated_into_applied_fields(monkeypatch):
-    extraction, _ = _run(monkeypatch, FakeInteraction(_reply()))
+def test_a_good_reply_becomes_fields_marked_to_check(monkeypatch):
+    extraction, _ = _run(monkeypatch, FakeResponse(_reply()))
     assert extraction.reason is None
     assert extraction.suggestions["amount"] == {
         "value": 120.0,
-        "confidence": 0.97,
-        "band": "high",
+        "confidence": 0.0,
+        "band": "medium",
         "applied": True,
     }
     assert extraction.answer() == {"suggestions": extraction.suggestions, "reason": None}
 
 
 def test_the_stable_prefix_goes_first_then_the_document_then_the_closing(monkeypatch):
-    _, client = _run(monkeypatch, FakeInteraction(_reply()))
-    request = client.interactions.last_request
-    kinds = [part["type"] for part in request["input"]]
-    assert kinds == ["text", "document", "text"]
-    assert request["input"][0]["text"] == "## Lists"
-    assert request["input"][1]["mime_type"] == "application/pdf"
-    assert request["system_instruction"] == "Read it."
+    _, client = _run(monkeypatch, FakeResponse(_reply()))
+    request = client.models.last_request
     assert request["model"] == "gemini-3.8-flash"
+    (content,) = request["contents"]
+    first, document, closing = content.parts
+    assert first.text == "## Lists" and closing.text == "Go."
+    assert document.inline_data.mime_type == "application/pdf"
+    assert document.inline_data.data == b"%PDF-1.4 fake"
+    assert request["config"].system_instruction == "Read it."
 
 
-def test_the_schema_requires_every_field_and_carries_no_titles(monkeypatch):
-    _, client = _run(monkeypatch, FakeInteraction(_reply()))
-    schema = client.interactions.last_request["response_format"]["schema"]
+def test_the_reply_is_json_to_a_schema_that_requires_every_field_and_carries_no_titles(monkeypatch):
+    _, client = _run(monkeypatch, FakeResponse(_reply()))
+    config = client.models.last_request["config"]
+    assert config.response_mime_type == "application/json"
+    schema = config.response_json_schema
     assert schema["required"] == sorted(Reply.model_fields)
     assert all("title" not in p and "default" not in p for p in schema["properties"].values())
 
 
-def test_an_image_is_sent_as_an_image(monkeypatch):
-    client = FakeClient(FakeInteraction(_reply()))
-    monkeypatch.setattr(ai, "get_client", lambda timeout_s: client)
-    ai.read(
-        b"\xff\xd8\xff",
-        "image/jpeg",
-        config=CONFIG,
-        instruction="",
-        prefix_text="",
-        closing_text="",
-        reply_model=Reply,
-        validate=_validate,
+def test_an_image_is_sent_with_its_own_type(monkeypatch):
+    _, client = _run(
+        monkeypatch, FakeResponse(_reply()), document=b"\xff\xd8\xff", mime="image/jpeg"
     )
-    assert client.interactions.last_request["input"][1]["type"] == "image"
+    (content,) = client.models.last_request["contents"]
+    assert content.parts[1].inline_data.mime_type == "image/jpeg"
 
 
-def test_the_output_budget_leaves_room_to_think(monkeypatch):
-    monkeypatch.delenv("TEST_AI_MAX_OUTPUT_TOKENS", raising=False)
-    _, client = _run(monkeypatch, FakeInteraction(_reply()))
-    assert client.interactions.last_request["generation_config"]["max_output_tokens"] >= 4096
-
-
-# --- bands -----------------------------------------------------------------------------------
-
-
-def test_low_confidence_is_never_applied_and_medium_is(monkeypatch):
-    extraction, _ = _run(
-        monkeypatch, FakeInteraction(_reply(amount_confidence=0.3, contact_confidence=0.7))
+def test_the_policy_s_budget_and_thinking_level_are_sent(monkeypatch):
+    config = ai.ReaderConfig(
+        label="test_ai", enabled=True, max_output_tokens=6000, thinking_level="medium"
     )
-    assert extraction.suggestions["amount"]["band"] == "low"
-    assert extraction.suggestions["amount"]["applied"] is False
-    assert extraction.suggestions["contact"]["band"] == "medium"
-    assert extraction.suggestions["contact"]["applied"] is True
+    _, client = _run(monkeypatch, FakeResponse(_reply()), config=config)
+    sent = client.models.last_request["config"]
+    assert sent.max_output_tokens == 6000
+    assert sent.thinking_config.thinking_level.name == "MEDIUM"
+    assert sent.automatic_function_calling.disable is True
+
+
+def test_the_model_s_thinking_is_not_read_as_the_reply(monkeypatch):
+    extraction, _ = _run(monkeypatch, FakeResponse(_reply(), thought="Let me think: {not json"))
+    assert extraction.reason is None and extraction.suggestions["contact"]["value"] == "con-sf"
 
 
 def test_nothing_usable_keeps_the_suggestions_and_says_why(monkeypatch):
-    extraction, _ = _run(monkeypatch, FakeInteraction(_reply(amount_value=0, contact_id="nope")))
+    extraction, _ = _run(monkeypatch, FakeResponse(_reply(amount_value=0, contact_id="nope")))
     assert extraction.reason == ai.REASON_NO_USABLE_FIELD
     assert extraction.answer() == {
         "suggestions": extraction.suggestions,
@@ -207,132 +192,120 @@ def test_nothing_usable_keeps_the_suggestions_and_says_why(monkeypatch):
     }
 
 
-@pytest.mark.parametrize("value, expected", [(1.5, 1.0), (-1, 0.0), ("x", 0.0), (None, 0.0)])
-def test_confidence_is_clamped(value, expected):
-    assert ai.clamp_confidence(value) == expected
-
-
 # --- the failure matrix: every one is "no suggestion" ------------------------------------------
 
 
 def test_malformed_json_is_discarded_whole(monkeypatch):
-    extraction, _ = _run(monkeypatch, FakeInteraction("not json at all"))
+    extraction, _ = _run(monkeypatch, FakeResponse("not json at all"))
     assert extraction.suggestions is None and extraction.reason == ai.REASON_INVALID_REPLY
     assert extraction.answer() == {"suggestions": None, "reason": ai.REASON_INVALID_REPLY}
 
 
 def test_a_reply_failing_the_schema_is_discarded_whole(monkeypatch):
-    extraction, _ = _run(monkeypatch, FakeInteraction(json.dumps({"amount_value": "lots"})))
+    extraction, _ = _run(monkeypatch, FakeResponse(json.dumps({"amount_value": "lots"})))
     assert extraction.suggestions is None and extraction.reason == ai.REASON_INVALID_REPLY
 
 
 def test_an_empty_reply_is_invalid(monkeypatch):
-    extraction, _ = _run(monkeypatch, FakeInteraction(""))
+    extraction, _ = _run(monkeypatch, FakeResponse(""))
     assert extraction.reason == ai.REASON_INVALID_REPLY
 
 
-def test_a_safety_block_is_not_retried(monkeypatch):
-    class Err:
-        message = "Blocked by safety filters: dangerous_content"
+@pytest.mark.parametrize("finish", ["SAFETY", "PROHIBITED_CONTENT", "RECITATION", "SPII"])
+def test_a_withheld_reply_is_a_safety_block_and_not_retried(monkeypatch, finish):
+    extraction, client = _run(monkeypatch, FakeResponse(None, finish=finish))
+    assert extraction.reason == ai.REASON_SAFETY_BLOCKED and client.models.calls == 1
 
+
+def test_a_blocked_document_is_a_safety_block(monkeypatch):
     extraction, client = _run(
-        monkeypatch, FakeInteraction(None, status="incomplete", errors=[Err()])
+        monkeypatch, FakeResponse(block="PROHIBITED_CONTENT", candidates=False)
     )
-    assert extraction.reason == ai.REASON_SAFETY_BLOCKED and client.interactions.calls == 1
+    assert extraction.reason == ai.REASON_SAFETY_BLOCKED and client.models.calls == 1
 
 
 def test_a_truncated_reply_is_discarded(monkeypatch):
-    class Err:
-        message = "max output tokens reached"
-
-    extraction, _ = _run(monkeypatch, FakeInteraction(None, status="incomplete", errors=[Err()]))
+    extraction, _ = _run(monkeypatch, FakeResponse('{"amount_value": 12', finish="MAX_TOKENS"))
     assert extraction.reason == ai.REASON_TRUNCATED
 
 
-def test_any_other_status_is_a_provider_error(monkeypatch):
-    extraction, _ = _run(monkeypatch, FakeInteraction(None, status="failed"))
+def test_the_sdk_s_enum_finish_reason_is_read_by_name(monkeypatch):
+    from google.genai import types
+
+    extraction, _ = _run(monkeypatch, FakeResponse(_reply(), finish=types.FinishReason.STOP))
+    assert extraction.reason is None
+    extraction, _ = _run(monkeypatch, FakeResponse("{", finish=types.FinishReason.MAX_TOKENS))
+    assert extraction.reason == ai.REASON_TRUNCATED
+
+
+@pytest.mark.parametrize(
+    "response", [FakeResponse(None, finish="OTHER"), FakeResponse(candidates=False)]
+)
+def test_any_other_ending_is_a_provider_error(monkeypatch, response):
+    extraction, _ = _run(monkeypatch, response)
     assert extraction.reason == ai.REASON_PROVIDER_ERROR
 
 
 def test_a_timeout_is_not_retried(monkeypatch):
     extraction, client = _run(monkeypatch, TimeoutError("deadline exceeded"))
-    assert extraction.reason == ai.REASON_TIMEOUT and client.interactions.calls == 1
+    assert extraction.reason == ai.REASON_TIMEOUT and client.models.calls == 1
 
 
-def test_interactions_raises_a_different_family_than_the_legacy_api():
-    compat = _compat()
-    from google.genai import errors as legacy
+def test_an_sdk_timeout_is_recognised_by_type_and_not_retried(monkeypatch):
+    import httpx
 
-    assert not issubclass(compat.RateLimitError, legacy.APIError)
-    assert compat.RateLimitError.status_code == 429
+    extraction, client = _run(monkeypatch, httpx.ReadTimeout("timed out"))
+    assert extraction.reason == ai.REASON_TIMEOUT and client.models.calls == 1
 
 
-@pytest.mark.parametrize("name, status", [("NotFoundError", 404), ("PermissionDeniedError", 403)])
-def test_404_and_403_are_not_retried(monkeypatch, name, status):
-    compat = _compat()
-    extraction, client = _run(monkeypatch, _status_error(getattr(compat, name), status, "no"))
-    assert extraction.reason == ai.REASON_PROVIDER_ERROR and client.interactions.calls == 1
+@pytest.mark.parametrize("status", [404, 403, 401, 400])
+def test_a_client_error_is_not_retried(monkeypatch, status):
+    extraction, client = _run(monkeypatch, _api_error(status, "no"))
+    assert extraction.reason == ai.REASON_PROVIDER_ERROR and client.models.calls == 1
 
 
 def test_a_429_is_rate_limited_not_a_transport_error(monkeypatch):
-    compat = _compat()
-    extraction, _ = _run(monkeypatch, _status_error(compat.RateLimitError, 429, "quota exceeded"))
+    extraction, _ = _run(monkeypatch, _api_error(429, "quota exceeded"))
     assert extraction.reason == ai.REASON_RATE_LIMITED
 
 
 def test_a_429_does_not_retry_when_the_advised_wait_blows_the_deadline(monkeypatch):
-    compat = _compat()
-    monkeypatch.setenv("TEST_AI_TIMEOUT_S", "25")
     slept = []
     monkeypatch.setattr(ai.time, "sleep", slept.append)
-    error = _status_error(compat.RateLimitError, 429, "Quota exceeded. Please retry in 39.6s.")
+    error = _api_error(429, "Quota exceeded. Please retry in 39.6s.")
     extraction, client = _run(monkeypatch, error)
     assert extraction.reason == ai.REASON_RATE_LIMITED
-    assert client.interactions.calls == 1 and slept == []
+    assert client.models.calls == 1 and slept == []
 
 
 def test_a_429_retries_once_when_the_advised_wait_fits(monkeypatch):
-    compat = _compat()
-    monkeypatch.setenv("TEST_AI_TIMEOUT_S", "25")
-
     def flaky(call_number):
         if call_number == 1:
-            raise _status_error(compat.RateLimitError, 429, "Slow down. Please retry in 1.5s.")
-        return FakeInteraction(_reply())
+            raise _api_error(429, "Slow down. Please retry in 1.5s.")
+        return FakeResponse(_reply())
 
     extraction, client = _run(monkeypatch, flaky)
-    assert extraction.reason is None and client.interactions.calls == 2
-
-
-def test_an_sdk_timeout_is_recognised_by_type_and_not_retried(monkeypatch):
-    compat = _compat()
-    import httpx
-
-    request = httpx.Request("POST", "https://generativelanguage.googleapis.com/x")
-    extraction, client = _run(monkeypatch, compat.APITimeoutError(request=request))
-    assert extraction.reason == ai.REASON_TIMEOUT and client.interactions.calls == 1
+    assert extraction.reason is None and client.models.calls == 2
 
 
 def test_a_server_error_retries_once_then_succeeds(monkeypatch):
-    compat = _compat()
-
     def flaky(call_number):
         if call_number == 1:
-            raise _status_error(compat.InternalServerError, 503, "unavailable")
-        return FakeInteraction(_reply())
+            raise _api_error(503, "unavailable")
+        return FakeResponse(_reply())
 
     extraction, client = _run(monkeypatch, flaky)
-    assert extraction.reason is None and client.interactions.calls == 2
+    assert extraction.reason is None and client.models.calls == 2
 
 
 def test_a_transport_error_twice_is_a_provider_error(monkeypatch):
     extraction, client = _run(monkeypatch, ConnectionError("reset"))
-    assert extraction.reason == ai.REASON_PROVIDER_ERROR and client.interactions.calls == 2
+    assert extraction.reason == ai.REASON_PROVIDER_ERROR and client.models.calls == 2
 
 
 def test_an_unconfigured_client_makes_no_call(monkeypatch):
-    def boom(timeout_s):
-        raise RuntimeError("GEMINI_API_KEY is not set")
+    def boom(timeout_s, region):
+        raise RuntimeError("Vertex AI is not configured")
 
     monkeypatch.setattr(ai, "get_client", boom)
     extraction = ai.read(
@@ -344,6 +317,7 @@ def test_an_unconfigured_client_makes_no_call(monkeypatch):
         closing_text="",
         reply_model=Reply,
         validate=_validate,
+        models=MODELS,
     )
     assert extraction.suggestions is None and extraction.reason == ai.REASON_NOT_CONFIGURED
 
@@ -352,12 +326,14 @@ def test_an_unconfigured_client_makes_no_call(monkeypatch):
 
 
 def test_thinking_tokens_are_recorded_separately(monkeypatch):
-    extraction, _ = _run(monkeypatch, FakeInteraction(_reply()))
+    extraction, _ = _run(monkeypatch, FakeResponse(_reply()))
+    assert extraction.audit["input_tokens"] == 5000
     assert extraction.audit["output_tokens"] == 300 and extraction.audit["thought_tokens"] == 400
+    assert extraction.audit["provider_request_id"] == "response-1"
 
 
 def test_cost_bills_thinking_at_the_output_rate(monkeypatch):
-    extraction, _ = _run(monkeypatch, FakeInteraction(_reply()))
+    extraction, _ = _run(monkeypatch, FakeResponse(_reply()))
     expected = (5000 / 1_000_000) * 0.75 + ((300 + 400) / 1_000_000) * 3.75
     assert extraction.audit["estimated_cost"] == round(expected, 6)
 
@@ -368,18 +344,18 @@ def test_an_unpriced_model_has_no_cost():
 
 def test_the_log_line_carries_numbers_never_values(monkeypatch, caplog):
     caplog.set_level("INFO", logger="minty-shared.ai")
-    extraction, _ = _run(monkeypatch, FakeInteraction(_reply(amount_value=4321.5)))
+    extraction, _ = _run(monkeypatch, FakeResponse(_reply(amount_value=4321.5)))
     ai.log_read(CONFIG, extraction, entity_id="ent-1", user_id="user-1")
     line = caplog.records[-1].getMessage()
     assert line.startswith(
         "test_ai: extract entity=ent-1 user=user-1 model=gemini-3.8-flash "
-        "attempts=gemini-3.8-flash:ok"
+        "attempts=gemini-3.8-flash:ok location=asia-southeast1"
     )
     assert "tokens_in=5000" in line and "status=ok" in line
     assert "4321" not in line and "con-sf" not in line
 
 
-# --- sniffing and the switch -------------------------------------------------------------------
+# --- sniffing ------------------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -396,73 +372,87 @@ def test_the_type_is_sniffed_from_the_bytes(data, expected):
     assert ai.sniff_mime(data) == expected
 
 
-def test_each_reader_has_its_own_switch(monkeypatch):
-    monkeypatch.setenv("TEST_AI_ENABLED", "true")
-    monkeypatch.delenv("OTHER_AI_ENABLED", raising=False)
-    assert CONFIG.enabled() is True
-    assert ai.ReaderConfig("OTHER_AI").enabled() is False
-    assert CONFIG.label == "test_ai"
+# --- the route: Vertex AI, in the region the environment names -----------------------------------
 
 
-# --- the switches that keep it safe by default --------------------------------------------------
+def test_a_reader_is_off_unless_its_settings_say_so():
+    assert ai.ReaderConfig(label="x").enabled is False
+    assert ai.ReaderConfig(label="x", max_file_mb=3).max_file_bytes == 3 * 1024 * 1024
 
 
-def test_a_reader_is_off_by_default(monkeypatch):
-    monkeypatch.delenv("TEST_AI_ENABLED", raising=False)
-    assert CONFIG.enabled() is False
+@pytest.mark.parametrize(
+    "project, region", [(None, "asia-southeast1"), (" ", "asia-southeast1"), ("minty-515207", "")]
+)
+def test_no_call_without_a_project_and_a_region(monkeypatch, project, region):
+    if project is None:
+        monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+    else:
+        monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", project)
+    with pytest.raises(RuntimeError, match="Vertex AI is not configured"):
+        ai.get_client(25, region)
 
 
-def test_the_direct_api_needs_an_explicit_opt_in(monkeypatch):
-    pytest.importorskip("google.genai")
-    monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
-    monkeypatch.delenv("EXPENSE_AI_ALLOW_DIRECT_API", raising=False)
-    monkeypatch.setenv("GEMINI_API_KEY", "a-key-that-should-not-be-used")
-    with pytest.raises(RuntimeError, match="not opted in"):
-        ai.get_client(25)
+def test_the_client_is_vertex_ai_in_the_named_region(monkeypatch):
+    from google import genai
+
+    made = {}
+
+    class Recorder:
+        def __init__(self, **kwargs):
+            made.update(kwargs)
+
+    monkeypatch.setattr(genai, "Client", Recorder)
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "minty-515207")
+    monkeypatch.setenv("AI_LOCATION", "global")  # the old setting: ignored
+    assert ai.project() == "minty-515207"
+    client = ai.get_client(25, "asia-southeast1")
+    assert made["vertexai"] is True
+    assert (made["project"], made["location"]) == ("minty-515207", "asia-southeast1")
+    assert made["http_options"].timeout == 25_000
+    assert ai.get_client(25, "asia-southeast1") is client  # one per process, region and timeout
+    assert ai.get_client(25, "global") is not client
 
 
-def test_the_direct_api_needs_a_key(monkeypatch):
-    pytest.importorskip("google.genai")
-    monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
-    monkeypatch.setenv("EXPENSE_AI_ALLOW_DIRECT_API", "true")
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    with pytest.raises(RuntimeError, match="GEMINI_API_KEY"):
-        ai.get_client(25)
-
-
-def test_vertex_is_the_route_whenever_a_project_is_set(monkeypatch):
-    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "minty-expense-ai")
-    monkeypatch.delenv("EXPENSE_AI_USE_VERTEX", raising=False)
-    assert ai.uses_vertex() is True and ai.location() == "asia-southeast1"
-
-
-def test_the_location_names_the_direct_route_and_its_tier(monkeypatch):
-    monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
-    monkeypatch.setenv("EXPENSE_AI_DIRECT_TIER", "paid")
-    assert ai.location() == "gemini-api-direct-paid"
-    monkeypatch.setenv("EXPENSE_AI_DIRECT_TIER", "enterprise")
-    assert ai.direct_tier() == "free"
-    monkeypatch.delenv("EXPENSE_AI_DIRECT_TIER")
-    assert ai.location() == "gemini-api-direct-free"
-
-
-def test_a_free_tier_quota_error_while_configured_paid_is_reported_but_switches_nothing_off(
-    monkeypatch, caplog
-):
-    compat = _compat()
-    monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
-    monkeypatch.setenv("EXPENSE_AI_DIRECT_TIER", "paid")
-    monkeypatch.setenv("TEST_AI_ENABLED", "true")
-    free = _status_error(
-        compat.RateLimitError, 429, "Quota exceeded for metric: generate_content_free_tier_requests"
+def test_the_reader_s_region_is_the_one_called(monkeypatch):
+    """Owner, 2026-11-20: the region is ai_policy.location, carried by the reader's settings."""
+    asked = []
+    client = FakeClient(FakeResponse(_reply()))
+    monkeypatch.setattr(
+        ai, "get_client", lambda timeout_s, region: asked.append((timeout_s, region)) or client
     )
-    assert ai._check_tier_matches_reality(free, CONFIG) is True
-    assert "CONFIGURATION MISMATCH" in caplog.text
-    assert CONFIG.enabled() is True
-    paid = _status_error(compat.RateLimitError, 429, "Quota exceeded. Retry later.")
-    assert ai._check_tier_matches_reality(paid, CONFIG) is False
-    monkeypatch.setenv("EXPENSE_AI_DIRECT_TIER", "free")
-    assert ai._check_tier_matches_reality(free, CONFIG) is False
+    config = ai.ReaderConfig(
+        label="test_ai", enabled=True, timeout_seconds=30, location="us-central1"
+    )
+    extraction = ai.read(
+        b"%PDF",
+        "application/pdf",
+        config=config,
+        instruction="",
+        prefix_text="",
+        closing_text="",
+        reply_model=Reply,
+        validate=_validate,
+        models=MODELS,
+    )
+    assert asked == [(30, "us-central1")] and extraction.audit["location"] == "us-central1"
+    assert ai.ReaderConfig(label="x").location == "asia-southeast1"
+
+
+def test_no_model_named_means_no_call(monkeypatch):
+    client = FakeClient(FakeResponse(_reply()))
+    monkeypatch.setattr(ai, "get_client", lambda timeout_s, region: client)
+    extraction = ai.read(
+        b"%PDF",
+        "application/pdf",
+        config=CONFIG,
+        instruction="",
+        prefix_text="",
+        closing_text="",
+        reply_model=Reply,
+        validate=_validate,
+        models=[],
+    )
+    assert extraction.reason == ai.REASON_NOT_CONFIGURED and client.models.calls == 0
 
 
 # --- models: failover and approved providers ---------------------------------------------------
@@ -559,7 +549,7 @@ def test_nothing_usable_is_an_answer_and_does_not_fail_over(monkeypatch):
     extraction, provider = _read_with(
         monkeypatch,
         {
-            "gemini-3.5-flash-lite": _reply(amount_confidence=0.1, contact_confidence=0.1),
+            "gemini-3.5-flash-lite": _reply(amount_value=0, contact_id="nope"),
             "gemini-3.8-flash": _reply(),
         },
         ["gemini-3.5-flash-lite", "gemini-3.8-flash"],
@@ -607,11 +597,6 @@ def test_a_named_gemini_model_reaches_gemini_without_its_prefix(monkeypatch):
         monkeypatch, {"gemini-3.8-flash": _reply()}, ["gemini:gemini-3.8-flash"]
     )
     assert provider.calls == ["gemini-3.8-flash"] and extraction.answered
-
-
-def test_no_list_means_the_reader_s_own_model(monkeypatch):
-    extraction, provider = _read_with(monkeypatch, {"gemini-3.8-flash": _reply()}, None)
-    assert provider.calls == ["gemini-3.8-flash"]
 
 
 def test_the_log_line_names_the_model_that_answered_after_a_failover(monkeypatch, caplog):

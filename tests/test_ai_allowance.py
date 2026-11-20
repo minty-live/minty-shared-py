@@ -7,6 +7,8 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from minty_shared.django.ai_allowance import (
+    READER_INVOICE,
+    READER_RECEIPT,
     GrantSpec,
     GrantUsage,
     PolicyError,
@@ -94,6 +96,89 @@ def test_the_models_are_primary_then_backup():
 def test_a_policy_without_a_primary_model_is_refused():
     with pytest.raises(PolicyError, match="primary_model"):
         parse_policy("  ", None, [])
+
+
+# --- the readers' settings (owner, 2026-11-20: ai_policy, not the environment) ----------------
+
+
+def test_each_reader_gets_its_own_switch_and_the_shared_settings():
+    settings = {
+        "receipt_reader_on": True,
+        "invoice_reader_on": False,
+        "timeout_s": 40,
+        "max_output_tokens": 6000,
+        "thinking_level": "medium",
+        "max_file_mb": 8,
+        "location": "global",
+    }
+    policy = parse_policy("gemini-3.5-flash", None, [], None, settings)
+    receipt, invoice = policy.reader(READER_RECEIPT), policy.reader(READER_INVOICE)
+    assert receipt.enabled is True and invoice.enabled is False
+    assert (receipt.label, invoice.label) == ("receipt_ai", "invoice_ai")
+    assert receipt.timeout_seconds == 40 and receipt.max_output_tokens == 6000
+    assert receipt.thinking_level == "medium" and receipt.max_file_bytes == 8 * 1024 * 1024
+    assert invoice.timeout_seconds == 40
+    assert (receipt.location, invoice.location) == ("global", "global")
+
+
+def test_a_reader_ships_dark_and_keeps_the_columns_defaults():
+    reader = parse_policy("gemini-3.5-flash", None, []).reader(READER_INVOICE)
+    assert reader.enabled is False
+    assert (reader.timeout_seconds, reader.max_output_tokens, reader.thinking_level) == (
+        25,
+        4096,
+        "low",
+    )
+    assert reader.max_file_mb == 10 and reader.location == "asia-southeast1"
+
+
+def test_an_unknown_reader_is_refused():
+    with pytest.raises(ValueError, match="unknown reader"):
+        parse_policy("gemini-3.5-flash", None, []).reader("sales")
+
+
+@pytest.mark.parametrize(
+    "raw, says",
+    [
+        ({"timeout_s": 4}, "timeout_s"),
+        ({"timeout_s": 121}, "at most 120"),
+        ({"max_output_tokens": 100}, "max_output_tokens"),
+        ({"max_file_mb": 21}, "at most 20"),
+        ({"max_file_mb": "10"}, "whole number"),
+        ({"thinking_level": "extreme"}, "thinking_level"),
+        ({"receipt_reader_on": "yes"}, "true or false"),
+        ({"temperature": 1}, "unknown reader settings"),
+        ({"location": ""}, "location"),
+        ({"location": "Asia Southeast1"}, "location"),
+        ({"location": "asia-southeast1;x"}, "location"),
+        ({"location": 5}, "location"),
+    ],
+)
+def test_a_setting_out_of_its_range_is_refused_with_its_reason(raw, says):
+    with pytest.raises(PolicyError, match=says):
+        parse_policy("gemini-3.5-flash", None, [], None, raw)
+
+
+@pytest.mark.parametrize("on, expected", [(True, True), (False, False)])
+def test_the_page_s_reader_follows_the_reader_s_switch(monkeypatch, on, expected):
+    from minty_shared.django import ai_allowance
+
+    policy = parse_policy("gemini-3.5-flash", None, [], None, {"receipt_reader_on": on})
+    monkeypatch.setattr(ai_allowance, "load_policy", lambda: policy)
+    monkeypatch.setattr(
+        ai_allowance, "status", lambda entity_id, p: summarise((), [], [grant(tokens=100)], NOW)
+    )
+    status = ai_allowance.reader_status(READER_RECEIPT, "ent-1")
+    assert status["enabled"] is expected
+    assert ("percent_left" in status) is expected
+    assert ai_allowance.reader_status(READER_INVOICE, "ent-1") == {"enabled": False}
+
+
+def test_no_usable_policy_means_no_reader(monkeypatch):
+    from minty_shared.django import ai_allowance
+
+    monkeypatch.setattr(ai_allowance, "load_policy", lambda: None)
+    assert ai_allowance.reader_status(READER_RECEIPT, "ent-1") == {"enabled": False}
 
 
 # --- a company's grants ----------------------------------------------------------------------

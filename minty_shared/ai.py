@@ -6,19 +6,20 @@ api's invoices) brings only what is its own - the company's lists, through ``min
 (the one prompt both send), and the check of the reply against those lists - and calls ``read``.
 Everything else is here:
 
-* configuration, per reader by prefix (``ReaderConfig("EXPENSE_AI")`` reads ``EXPENSE_AI_ENABLED``,
-  ``_MODEL``, ...), read on every call so the kill switch and cut-offs turn without a deploy. The
-  route to the model (Vertex or the direct API, its tier) is one setting for every reader;
+* the reader's settings, a ``ReaderConfig`` - its switch, the call's timeout, the reply's token
+  budget, the thinking level, the largest document. They are ``ai_policy``'s, given by
+  ``minty_shared.django.ai_allowance.Policy.reader`` and read on every call, so they turn with an
+  UPDATE, never a deploy (owner, 2026-11-20; they were each service's environment);
 * the models: a read tries the first model it is given and, when that one errors, times out, is
   rate-limited or replies with something unusable, the next (the failover; owner, 2026-11-18). A
-  model id names its provider (``gemini-3.8-flash``, or ``<provider>:<model>``), and only a provider
+  model id names its provider (``gemini-3.5-flash``, or ``<provider>:<model>``), and only a provider
   in ``APPROVED_PROVIDERS`` is ever called - paid terms, customer content not used for training.
   Each provider is a ``Provider`` in ``PROVIDERS``; Gemini is the only one today;
 * the client (one per process and timeout), the call with at most ONE retry and only for the
   retryable classes, usage and estimated cost, and which model answered;
-* the reply's shape: a field is ``{value, confidence, band, applied}``, and ``applied`` is the
-  page's instruction (a low band is never prefilled; ``checked`` is a field from a reply with no
-  confidence - the owner's simple prompt, ``minty_shared.ai_prompt`` - always ``medium``).
+* the reply's shape: a field is ``{value, confidence, band, applied}`` and ``applied`` is the
+  page's instruction; ``checked`` makes one from a reply with no confidence - the owner's simple
+  prompt, ``minty_shared.ai_prompt`` - always in the ``medium`` band.
 
 FAILURE IS ALWAYS SILENT to the person: every error returns "no suggestion" with a ``REASON_*``
 code, and the form works by hand as before. The reply is a suggestion - nothing here writes any
@@ -26,18 +27,18 @@ record. How many reads a company may make is not this module's: the readers ask
 ``minty_shared.django.ai_allowance`` (the shared allowance in ``ai_policy``/``ai_read``), which also
 supplies the models to try. Extra ``ai``.
 
-ROUTES. Vertex AI (``GOOGLE_CLOUD_PROJECT``; IAM, a regional residency commitment) is chosen
-whenever a project is set - the owner's choice (project ``minty-515207``, ``asia-southeast1``),
-deferred on 2026-11-20. The route in use in both environments is the direct Gemini API on the FREE
-tier, which does not meet "approved providers only" (on it Google may use submitted content and
-human reviewers may read it): decide before customers' documents are read. The tier is stated in
-configuration (``EXPENSE_AI_DIRECT_TIER``) and ``_check_tier_matches_reality`` shouts when Google's
-own quota errors contradict it.
+THE ROUTE. Vertex AI only (owner, 2026-11-20; the direct Gemini API is gone): Google Cloud's paid
+terms, IAM instead of an API key, and a regional endpoint - ``asia-southeast1`` (Singapore), where
+the services run. The region is ``ai_policy.location`` (a reader's ``ReaderConfig.location``) -
+it decides which models exist, so it sits beside them; each service's environment names only the
+project (``GOOGLE_CLOUD_PROJECT``, without it no call is made), and Google's client finds the service
+account's key through ``GOOGLE_APPLICATION_CREDENTIALS``. The call is
+``models.generate_content``: Vertex serves ``interactions.create`` only in ``global``, ``us`` and
+``eu``, which would take the document out of the region.
 """
 
 from __future__ import annotations
 
-import base64
 import logging
 import os
 import random
@@ -50,8 +51,6 @@ from dataclasses import field as dataclass_field
 from typing import Any, Protocol
 
 from pydantic import BaseModel, ValidationError
-
-from minty_shared.config import flag
 
 logger = logging.getLogger("minty-shared.ai")
 
@@ -78,8 +77,9 @@ _MAGIC = (
     (b"\x89PNG\r\n\x1a\n", "image/png"),
 )
 
-# Model list prices, USD per 1M tokens (input, output), checked 3 Sep 2026. An indication for
-# the log's cost field, not an invoice; re-verify at each stage gate.
+# Model list prices, USD per 1M tokens (input, output), checked 3 Sep 2026 (the Gemini API's; Vertex
+# AI lists the same models at its own prices). An indication for the log's cost field, not an
+# invoice; re-verify at each stage gate.
 PRICING = {
     "gemini-3.1-pro-preview": (2.00, 12.00),
     "gemini-3.8-flash": (0.75, 3.75),
@@ -91,92 +91,40 @@ PRICING = {
 
 # --------------------------------------------------------------------------- configuration
 
+#: ``ai_policy.thinking_level``'s values (its CHECK), as Gemini 3.x names them.
+THINKING_LEVELS = ("minimal", "low", "medium", "high")
 
-def _env(name: str, default: Any = None) -> Any:
+
+def _env(name: str) -> str | None:
     value = os.environ.get(name)
-    return default if value is None or value == "" else value
-
-
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(str(_env(name, default)).strip())
-    except (TypeError, ValueError):
-        return default
-
-
-def _env_float(name: str, default: float) -> float:
-    try:
-        return float(str(_env(name, default)).strip())
-    except (TypeError, ValueError):
-        return default
+    return None if value is None or value.strip() == "" else value.strip()
 
 
 @dataclass(frozen=True)
 class ReaderConfig:
-    """One reader's settings, ``<prefix>_*``, read from the environment on each call."""
+    """One reader's settings - ``ai_policy``'s, from ``ai_allowance.Policy.reader`` (owner,
+    2026-11-20; they were the service's environment). ``label`` tags its log lines."""
 
-    prefix: str
+    label: str
+    enabled: bool = False  # the reader's switch: a reader ships dark
+    timeout_seconds: int = 25  # each model call's limit
+    # Thinking tokens come out of this same budget on Gemini 3.x: a long think truncates the JSON
+    # mid-object at a budget that looks ample for the reply alone.
+    max_output_tokens: int = 4096
+    thinking_level: str = "low"
+    max_file_mb: int = 10
+    # Vertex AI's region (ai_policy.location): Singapore, where the services run. Recorded on every
+    # read's log line.
+    location: str = "asia-southeast1"
 
     @property
-    def label(self) -> str:
-        """The log tag: ``EXPENSE_AI`` -> ``expense_ai``."""
-        return self.prefix.lower()
-
-    def enabled(self) -> bool:
-        """The kill switch. Default off - a reader ships dark."""
-        return flag(f"{self.prefix}_ENABLED", False, blank_is_unset=True)
-
-    def model_id(self) -> str:
-        """The model when no list is given to ``read`` - the APIs pass ``ai_policy``'s, so this is
-        only the fallback. A Gemini id MUST be 3.x: ``interactions.create`` (the only API with
-        implicit caching) serves 3.x only, and the 2.5 family answers 404 here though
-        ``models.list`` shows it."""
-        return _env(f"{self.prefix}_MODEL", "gemini-3.5-flash")
-
-    def thinking_level(self) -> str:
-        level = str(_env(f"{self.prefix}_THINKING_LEVEL", "low")).strip().lower()
-        return level if level in ("low", "medium", "high") else "low"
-
     def max_file_bytes(self) -> int:
-        return _env_int(f"{self.prefix}_MAX_FILE_MB", 10) * 1024 * 1024
-
-    def timeout_seconds(self) -> int:
-        return _env_int(f"{self.prefix}_TIMEOUT_S", 25)
-
-    def max_output_tokens(self) -> int:
-        """Thinking tokens come out of this same allowance on Gemini 3.x: a long think truncates
-        the JSON mid-object at a budget that looks ample for the reply alone."""
-        return _env_int(f"{self.prefix}_MAX_OUTPUT_TOKENS", 4096)
-
-    def confidence_cutoffs(self) -> tuple[float, float]:
-        """(high, medium). Set from measured data before a pilot, never guessed."""
-        return (
-            _env_float(f"{self.prefix}_CONF_HIGH", 0.85),
-            _env_float(f"{self.prefix}_CONF_MEDIUM", 0.60),
-        )
+        return self.max_file_mb * 1024 * 1024
 
 
-def uses_vertex() -> bool:
-    """Vertex is the route unless someone deliberately opted out of it."""
-    if _env("GOOGLE_CLOUD_PROJECT"):
-        return flag("EXPENSE_AI_USE_VERTEX", True, blank_is_unset=True)
-    return False
-
-
-def direct_tier() -> str:
-    """The Gemini API terms we run under, "paid" or "free". Nothing at the call site can tell them
-    apart, so the safe default for an unconfigured key is the restrictive one: claiming "paid" is
-    a deliberate act."""
-    tier = str(_env("EXPENSE_AI_DIRECT_TIER", "free")).strip().lower()
-    return tier if tier in ("free", "paid") else "free"
-
-
-def location() -> str:
-    """Recorded on every log line. On the direct API there is no region, and that absence is the
-    fact worth recording: the value names the route and the tier instead."""
-    if uses_vertex():
-        return _env("EXPENSE_AI_LOCATION", "asia-southeast1")
-    return "gemini-api-direct-" + direct_tier()
+def project() -> str | None:
+    """The Google Cloud project Vertex AI bills (``GOOGLE_CLOUD_PROJECT``)."""
+    return _env("GOOGLE_CLOUD_PROJECT")
 
 
 # --------------------------------------------------------------------------- files
@@ -191,15 +139,23 @@ def sniff_mime(data: bytes) -> str | None:
 
 # --------------------------------------------------------------------------- the client
 
-_clients: dict[int, Any] = {}
+_clients: dict[tuple[str, int], Any] = {}
 _client_lock = threading.Lock()
 
 
-def get_client(timeout_s: int) -> Any:
-    """One google-genai client per process and timeout. Raises when no route is configured."""
+def get_client(timeout_s: int, region: str) -> Any:
+    """One Vertex AI client per process, region and timeout. Raises when the project or the region
+    is not named - no call is ever made somewhere unnamed. The credentials are Google's own lookup
+    (``GOOGLE_APPLICATION_CREDENTIALS``, the service account's key file)."""
     with _client_lock:
-        if timeout_s in _clients:
-            return _clients[timeout_s]
+        if (region, timeout_s) in _clients:
+            return _clients[(region, timeout_s)]
+        name = project()
+        if not name or not region:
+            raise RuntimeError(
+                "Vertex AI is not configured: set GOOGLE_CLOUD_PROJECT (and "
+                "GOOGLE_APPLICATION_CREDENTIALS, the service account's key file), and ai_policy.location."
+            )
         from google import genai
         from google.genai import types
 
@@ -209,44 +165,11 @@ def get_client(timeout_s: int) -> Any:
             # a form. One attempt; the single retry allowed is ours, in call_model.
             retry_options=types.HttpRetryOptions(attempts=1),
         )
-        if uses_vertex():
-            client = genai.Client(
-                vertexai=True,
-                project=_env("GOOGLE_CLOUD_PROJECT"),
-                location=location(),
-                http_options=http_options,
-            )
-            logger.info(
-                "ai: Vertex AI client ready, project=%s location=%s",
-                _env("GOOGLE_CLOUD_PROJECT"),
-                location(),
-            )
-        else:
-            if not flag("EXPENSE_AI_ALLOW_DIRECT_API", False, blank_is_unset=True):
-                raise RuntimeError(
-                    "No GOOGLE_CLOUD_PROJECT configured and the direct Gemini API is not opted "
-                    "in. Set GOOGLE_CLOUD_PROJECT for the Vertex route, or "
-                    "EXPENSE_AI_ALLOW_DIRECT_API=true to use the direct API."
-                )
-            api_key = _env("GEMINI_API_KEY")
-            if not api_key:
-                raise RuntimeError("GEMINI_API_KEY is not set")
-            client = genai.Client(api_key=api_key, http_options=http_options)
-            if direct_tier() == "paid":
-                logger.info(
-                    "ai: direct Gemini API, PAID tier. Content is not used to improve Google "
-                    "products; prompts and responses are retained briefly for abuse detection. "
-                    "NOTE: this route pins no region - documents may be processed outside "
-                    "Singapore."
-                )
-            else:
-                logger.warning(
-                    "ai: direct Gemini API, FREE tier. Google may use submitted content to "
-                    "develop its products and HUMAN REVIEWERS may read input and output. "
-                    "Non-customer documents ONLY. Set EXPENSE_AI_DIRECT_TIER=paid once billing "
-                    "is enabled on the key."
-                )
-        _clients[timeout_s] = client
+        client = genai.Client(
+            vertexai=True, project=name, location=region, http_options=http_options
+        )
+        logger.info("ai: Vertex AI client ready, project=%s location=%s", name, region)
+        _clients[(region, timeout_s)] = client
         return client
 
 
@@ -268,40 +191,6 @@ def response_schema(model: type[BaseModel]) -> dict[str, Any]:
         prop.pop("title", None)
         prop.pop("default", None)
     return {"type": "object", "properties": properties, "required": sorted(properties)}
-
-
-def clamp_confidence(value: object) -> float:
-    try:
-        return max(0.0, min(1.0, float(value)))  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def band(confidence: float, config: ReaderConfig) -> str:
-    high, medium = config.confidence_cutoffs()
-    if confidence >= high:
-        return "high"
-    if confidence >= medium:
-        return "medium"
-    return "low"
-
-
-def field(
-    value: Any, confidence: object, config: ReaderConfig, extra: dict[str, Any] | None = None
-) -> dict[str, Any]:
-    """One suggestion. A low-band or dropped field keeps its confidence for the log, but
-    ``applied`` is false: a wrong suggestion costs the person more than none."""
-    conf = clamp_confidence(confidence)
-    level = band(conf, config)
-    out: dict[str, Any] = {
-        "value": value,
-        "confidence": round(conf, 3),
-        "band": level,
-        "applied": bool(value not in (None, "")) and level != "low",
-    }
-    if extra:
-        out.update(extra)
-    return out
 
 
 def checked(value: Any, extra: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -357,75 +246,119 @@ class Provider(Protocol):
 
 
 class GeminiProvider:
-    """Gemini through ``google-genai``'s ``interactions.create``: Vertex AI or the direct API
-    (``uses_vertex``), one client per process and timeout, at most one retry (``call_model``)."""
+    """Gemini on Vertex AI through ``google-genai``'s ``models.generate_content``, one client per
+    process and timeout, at most one retry (``call_model``)."""
 
     name = "gemini"
 
     def call(self, model: str, parts: DocumentParts, config: ReaderConfig) -> ProviderReply:
         try:
-            client = get_client(config.timeout_seconds())
+            client = get_client(config.timeout_seconds, config.location)
+            from google.genai import types
         except Exception as exc:  # noqa: BLE001 - every failure is a reason, never a raise
             logger.error("%s: client unavailable: %s", config.label, exc)
             return ProviderReply(reason=REASON_NOT_CONFIGURED)
-        request = {
-            "model": model,
-            "input": [
-                {"type": "text", "text": parts.prefix_text},
-                {
-                    "type": "document" if parts.mime == "application/pdf" else "image",
-                    "data": base64.b64encode(parts.document).decode("ascii"),
-                    "mime_type": parts.mime,
-                },
-                {"type": "text", "text": parts.closing_text},
-            ],
-            "system_instruction": parts.instruction,
-            "response_format": {
-                "type": "text",
-                "mime_type": "application/json",
-                "schema": parts.schema,
-            },
-            "generation_config": {
-                "thinking_level": config.thinking_level(),
-                "max_output_tokens": config.max_output_tokens(),
-            },
-        }
-        interaction, reason = call_model(client, request, config)
-        if interaction is None:
+        contents = [
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part.from_text(text=parts.prefix_text),
+                    types.Part.from_bytes(data=parts.document, mime_type=parts.mime),
+                    types.Part.from_text(text=parts.closing_text),
+                ],
+            )
+        ]
+        settings = types.GenerateContentConfig(
+            system_instruction=parts.instruction,
+            response_mime_type="application/json",
+            response_json_schema=parts.schema,
+            max_output_tokens=config.max_output_tokens,
+            thinking_config=types.ThinkingConfig(
+                thinking_level=types.ThinkingLevel[config.thinking_level.upper()]
+            ),
+            # no tools are offered, so nothing for the SDK to call on our behalf
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        )
+        response, reason = call_model(
+            lambda: client.models.generate_content(model=model, contents=contents, config=settings),
+            model,
+            config,
+        )
+        if response is None:
             return ProviderReply(reason=reason)
         reply = ProviderReply(
-            usage=_gemini_usage(interaction), request_id=getattr(interaction, "id", None)
+            usage=_gemini_usage(response), request_id=getattr(response, "response_id", None)
         )
-        status = str(getattr(interaction, "status", "") or "")
-        if status == "incomplete":
-            # Truncation and a safety block both land here; neither is retried.
-            detail = _error_detail(interaction)
-            blocked = "safety" in detail.lower() or "block" in detail.lower()
-            if blocked:
-                logger.warning("%s: blocked by safety filters (%s)", config.label, detail)
-            else:
-                logger.warning(
-                    "%s: reply truncated - output=%s thought=%s against max_output_tokens=%s. "
-                    "Raise %s_MAX_OUTPUT_TOKENS if this recurs. (%s)",
-                    config.label,
-                    reply.usage.get("output_tokens"),
-                    reply.usage.get("thought_tokens"),
-                    config.max_output_tokens(),
-                    config.prefix,
-                    detail,
-                )
-            reply.reason = REASON_SAFETY_BLOCKED if blocked else REASON_TRUNCATED
-            return reply
-        if status != "completed":
+        blocked = _name(getattr(getattr(response, "prompt_feedback", None), "block_reason", None))
+        if blocked:
             logger.warning(
-                "%s: interaction status=%s (%s)", config.label, status, _error_detail(interaction)
+                "%s: the document was blocked by safety filters (%s)", config.label, blocked
             )
+            reply.reason = REASON_SAFETY_BLOCKED
+            return reply
+        candidates = getattr(response, "candidates", None) or []
+        if not candidates:
+            logger.warning("%s: the model returned no candidate", config.label)
             reply.reason = REASON_PROVIDER_ERROR
             return reply
-        reply.text = getattr(interaction, "output_text", None) or None
+        finish = _name(getattr(candidates[0], "finish_reason", None))
+        if finish == "MAX_TOKENS":
+            # neither a truncation nor a block is retried
+            logger.warning(
+                "%s: reply truncated - output=%s thought=%s against max_output_tokens=%s. "
+                "Raise ai_policy.max_output_tokens if this recurs.",
+                config.label,
+                reply.usage.get("output_tokens"),
+                reply.usage.get("thought_tokens"),
+                config.max_output_tokens,
+            )
+            reply.reason = REASON_TRUNCATED
+            return reply
+        if finish in _BLOCKED:
+            logger.warning("%s: blocked by safety filters (%s)", config.label, finish)
+            reply.reason = REASON_SAFETY_BLOCKED
+            return reply
+        if finish != "STOP":
+            logger.warning("%s: the model stopped with %s", config.label, finish or "no reason")
+            reply.reason = REASON_PROVIDER_ERROR
+            return reply
+        reply.text = _reply_text(candidates[0]) or None
         if reply.text is None:
             reply.reason = REASON_INVALID_REPLY
         return reply
+
+
+#: A finish reason that means the reply was withheld - not retried, not failed over.
+_BLOCKED = frozenset(
+    {
+        "SAFETY",
+        "RECITATION",
+        "BLOCKLIST",
+        "PROHIBITED_CONTENT",
+        "SPII",
+        "IMAGE_SAFETY",
+        "IMAGE_PROHIBITED_CONTENT",
+        "IMAGE_RECITATION",
+    }
+)
+
+
+def _name(value: Any) -> str:
+    """An SDK enum's name (``FinishReason.STOP`` -> ``"STOP"``), a plain string as it is, or ""."""
+    if value is None:
+        return ""
+    return str(getattr(value, "name", None) or value)
+
+
+def _reply_text(candidate: Any) -> str:
+    """The reply's text: every text part that is not the model's thinking, joined."""
+    content = getattr(candidate, "content", None)
+    pieces = [
+        part.text
+        for part in (getattr(content, "parts", None) or [])
+        if getattr(part, "text", None) and not getattr(part, "thought", False)
+    ]
+    return "".join(pieces)
 
 
 #: Every provider the engine can call, by name.
@@ -511,9 +444,9 @@ def read(
 ) -> Extraction:
     """Read one prepared document. Never raises.
 
-    ``models`` is the list to try in order (the primary, then the backup - ``ai_policy``'s); none
-    given = ``config.model_id()`` alone. The next model is tried only when one ends in a
-    ``FAILOVER_REASONS`` reason, so a read makes at most one call per model (each with its own
+    ``models`` is the list to try in order (the primary, then the backup - ``ai_policy``'s); with
+    none, nothing is called (``REASON_NOT_CONFIGURED``). The next model is tried only when one ends
+    in a ``FAILOVER_REASONS`` reason, so a read makes at most one call per model (each with its own
     ``timeout_seconds``).
 
     ``prefix_text`` (the entity's lists) goes FIRST and must be byte-stable for the same entity:
@@ -523,16 +456,18 @@ def read(
     check is dropped, never repaired."""
     started = time.monotonic()
     chain: list[str] = []
-    for model in models or [config.model_id()]:
+    for model in models or []:
         if model and model not in chain:
             chain.append(model)
     audit: dict[str, Any] = {
         "model_id": chain[0] if chain else None,
         "model_answered": None,
         "attempts": [],
-        "location": location(),
-        "thinking_level": config.thinking_level(),
+        "location": config.location,
+        "thinking_level": config.thinking_level,
     }
+    if not chain:
+        logger.error("%s: no model to read with - ai_policy names none", config.label)
     parts = DocumentParts(
         prefix_text=prefix_text,
         document=document,
@@ -666,10 +601,9 @@ def log_read(
     )
 
 
-# The SDK's ``interactions.create`` raises a different exception family from the legacy
-# ``models.generate_content`` (``google.genai._gaos...compat_errors``, all carrying
-# ``.status_code``). Classifying on the ``status_code``/``code`` ATTRIBUTE, not class identity,
-# keeps a 429 from being reported as a transport error and survives the private path moving.
+# ``models.generate_content`` raises ``google.genai.errors.ClientError``/``ServerError`` carrying
+# ``.code``. Classifying on the ``status_code``/``code`` ATTRIBUTE, not class identity, keeps a 429
+# from being reported as a transport error whichever exception family the SDK uses.
 _RETRY_DELAY = re.compile(r"retry in ([0-9]+(?:\.[0-9]+)?)\s*s", re.IGNORECASE)
 
 
@@ -687,48 +621,26 @@ def _is_timeout(exc: BaseException) -> bool:
     return any("timeout" in klass.__name__.lower() for klass in type(exc).__mro__)
 
 
-def _check_tier_matches_reality(exc: BaseException, config: ReaderConfig) -> bool:
-    """Shout if we believe we are on the paid tier and Google says otherwise: its free-tier quota
-    errors name the metric ("..._free_tier_requests"). Deliberately does NOT switch the reader
-    off - a transient message must not end the feature for everyone; that is a human decision."""
-    if uses_vertex() or direct_tier() != "paid":
-        return False
-    if "free_tier" not in str(exc).lower():
-        return False
-    logger.error(
-        "%s: CONFIGURATION MISMATCH - EXPENSE_AI_DIRECT_TIER=paid, but Google rejected this "
-        "request against a FREE TIER quota. If billing is not active on this key, customer "
-        "documents are being processed under free-tier terms, where Google may use them and "
-        "human reviewers may read them. Set %s_ENABLED=false and confirm billing first.",
-        config.label,
-        config.prefix,
-    )
-    return True
-
-
 def _advised_delay(exc: BaseException) -> float | None:
     """Seconds the provider asked us to wait, if it said ("Please retry in 39.6s")."""
     match = _RETRY_DELAY.search(str(exc))
     return float(match.group(1)) if match else None
 
 
-def call_model(
-    client: Any, request: dict[str, Any], config: ReaderConfig
-) -> tuple[Any, str | None]:
+def call_model(send: Callable[[], Any], model: str, config: ReaderConfig) -> tuple[Any, str | None]:
     """One call and at most one retry - only for the retryable classes, most specific first:
     a timeout has spent the budget (no retry); a 429 retries once only if the provider's advised
     wait fits the deadline; 401/403/404 and other 4xx never; 5xx and transport errors once."""
-    deadline = time.monotonic() + config.timeout_seconds()
+    deadline = time.monotonic() + config.timeout_seconds
     for attempt in (1, 2):
         try:
-            return client.interactions.create(**request), None
+            return send(), None
         except Exception as exc:  # noqa: BLE001 - classified below by status
             status = _error_status(exc)
             if _is_timeout(exc):
-                logger.warning("%s: timed out after %ss", config.label, config.timeout_seconds())
+                logger.warning("%s: timed out after %ss", config.label, config.timeout_seconds)
                 return None, REASON_TIMEOUT
             if status == 429:
-                _check_tier_matches_reality(exc, config)
                 advised = _advised_delay(exc)
                 remaining = deadline - time.monotonic()
                 delay = advised if advised is not None else 0.5 + random.random()
@@ -743,7 +655,7 @@ def call_model(
                     "giving up without retrying",
                     config.label,
                     advised,
-                    config.timeout_seconds(),
+                    config.timeout_seconds,
                 )
                 return None, REASON_RATE_LIMITED
             if status in (401, 403):
@@ -759,8 +671,8 @@ def call_model(
                     "%s: MODEL NOT FOUND (404) - %s is not served where we are calling "
                     "(%s). Page on-call.",
                     config.label,
-                    request.get("model"),
-                    location(),
+                    model,
+                    config.location,
                 )
                 return None, REASON_PROVIDER_ERROR
             if status is not None and 400 <= status < 500:
@@ -779,26 +691,18 @@ def call_model(
     return None, REASON_PROVIDER_ERROR
 
 
-def _error_detail(interaction: Any) -> str:
-    try:
-        entries = getattr(interaction, "errors", None) or []
-        return "; ".join(str(getattr(e, "message", e)) for e in entries)[:300]
-    except Exception:  # noqa: BLE001
-        return ""
-
-
-def _gemini_usage(interaction: Any) -> dict[str, int | None]:
-    usage = getattr(interaction, "usage", None)
+def _gemini_usage(response: Any) -> dict[str, int | None]:
+    usage = getattr(response, "usage_metadata", None)
     if usage is None:
         return {}
     return {
-        "input_tokens": getattr(usage, "total_input_tokens", None),
-        "output_tokens": getattr(usage, "total_output_tokens", None),
+        "input_tokens": getattr(usage, "prompt_token_count", None),
+        "output_tokens": getattr(usage, "candidates_token_count", None),
         # Thinking tokens: invisible in the reply, billed at the OUTPUT rate, drawn from
         # max_output_tokens. Without them a truncation by thinking looks like a verbose answer.
-        "thought_tokens": getattr(usage, "total_thought_tokens", None),
+        "thought_tokens": getattr(usage, "thoughts_token_count", None),
         # Zero across repeated same-entity calls: the prefix is under the cache minimum or unstable.
-        "cached_tokens": getattr(usage, "total_cached_tokens", None),
+        "cached_tokens": getattr(usage, "cached_content_token_count", None),
     }
 
 
