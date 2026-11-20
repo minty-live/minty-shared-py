@@ -139,17 +139,66 @@ def test_an_ended_session_is_dead_and_each_sid_is_asked_about_separately():
     assert calls == ["gone", "s2"]
 
 
-def test_accounts_api_unreachable_honours_the_token_logs_it_and_asks_again_a_minute_later(caplog):
+def test_accounts_api_unreachable_honours_a_sign_in_confirmed_in_the_last_five_minutes(caplog):
+    """v0.9 (owner, 2026-11-19): a blip goes unnoticed - the token is honoured, logged at ERROR, and
+    asked about again a minute later - but only within 5 minutes of the last time accounts-api
+    said this sign-in lives. Past that the request is refused (SessionCheckUnavailableError, a 503)."""
     clock = _Clock()
-    touch, calls = _touches({"s1": tokens.SessionCheckError("connection refused")})
+    answers = {"s1": True}
+    touch, calls = _touches(answers)
     gate = tokens.SessionGate(clock=clock)
+    assert gate.alive("s1", touch) is True  # confirmed at 1000
+    answers["s1"] = tokens.SessionCheckError("connection refused")
+    clock.now += 61
     with caplog.at_level("ERROR", logger="minty_shared.tokens"):
         assert gate.alive("s1", touch) is True
     assert "connection refused" in caplog.text and "s1" not in caplog.text
-    assert gate.alive("s1", touch) is True and calls == ["s1"]
+    assert gate.alive("s1", touch) is True and calls == ["s1", "s1"]  # not asked again yet
     clock.now += 61
-    gate.alive("s1", touch)
-    assert calls == ["s1", "s1"]
+    assert gate.alive("s1", touch) is True and len(calls) == 3
+    clock.now = 1000 + tokens.SESSION_CHECK_GRACE_SECONDS - 1
+    assert gate.alive("s1", touch) is True
+    clock.now = 1000 + tokens.SESSION_CHECK_GRACE_SECONDS + 1
+    with pytest.raises(tokens.SessionCheckUnavailableError) as refused:
+        gate.alive("s1", touch)
+    assert str(refused.value) == "Minty can't check your sign-in just now. Try again in a minute."
+
+
+def test_a_sign_in_never_confirmed_is_refused_at_once_while_accounts_api_is_unreachable():
+    touch, calls = _touches({"s1": tokens.SessionCheckError("timed out")})
+    gate = tokens.SessionGate(clock=_Clock())
+    with pytest.raises(tokens.SessionCheckUnavailableError):
+        gate.alive("s1", touch)
+    with pytest.raises(tokens.SessionCheckUnavailableError):
+        gate.alive("s1", touch)
+    assert calls == ["s1", "s1"], "a refusal is not remembered: the next request asks again"
+
+
+def test_once_accounts_api_answers_again_the_sign_in_is_confirmed_afresh():
+    clock = _Clock()
+    answers = {"s1": tokens.SessionCheckError("down")}
+    touch, _ = _touches(answers)
+    gate = tokens.SessionGate(clock=clock)
+    with pytest.raises(tokens.SessionCheckUnavailableError):
+        gate.alive("s1", touch)
+    answers["s1"] = True
+    assert gate.alive("s1", touch) is True
+    answers["s1"] = tokens.SessionCheckError("down again")
+    clock.now += tokens.SESSION_CHECK_GRACE_SECONDS - 1
+    assert gate.alive("s1", touch) is True
+
+
+def test_an_ended_sign_in_stays_ended_while_accounts_api_is_unreachable():
+    """An ended sign-in never comes back, so it is still refused as ended (401, "Your session has
+    expired") - not a 503."""
+    clock = _Clock()
+    answers = {"gone": False}
+    touch, _ = _touches(answers)
+    gate = tokens.SessionGate(clock=clock)
+    assert gate.alive("gone", touch) is False
+    answers["gone"] = tokens.SessionCheckError("down")
+    clock.now += tokens.SESSION_CHECK_GRACE_SECONDS + 61
+    assert gate.alive("gone", touch) is False
 
 
 def test_forget_empties_the_cache():
@@ -282,6 +331,21 @@ def test_a_valid_token_whose_sign_in_has_ended_is_a_session_end(_sessions):
 
 def test_an_expired_token_whose_sign_in_lives_is_not(_sessions):
     assert tokens.session_ended(_at(-3600, sid="s1"), "https://a.test", SECRET) is False
+
+
+def test_an_expired_token_is_no_session_end_while_accounts_api_cannot_answer(monkeypatch):
+    """Already refused for its expiry: unable to ask, it is a plain 401 (renewed quietly), never
+    a 503 and never "your session has expired"."""
+
+    def down(url, secret, sid):
+        raise tokens.SessionCheckError("down")
+
+    monkeypatch.setattr(tokens, "touch_over_http", down)
+    tokens.SESSIONS.forget()
+    try:
+        assert tokens.session_ended(_at(-3600, sid="s1"), "https://a.test", SECRET) is False
+    finally:
+        tokens.SESSIONS.forget()
 
 
 def test_no_sid_a_forged_or_a_malformed_token_is_never_a_session_end(_sessions):

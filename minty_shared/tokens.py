@@ -16,8 +16,12 @@
   (:class:`SessionGate`); a session that has ended answers 410 and the caller refuses the token
   (401), so signing out of Minty, or 60 idle minutes, ends every app. A token with no ``sid``
   (minted before v0.8) is alive until it expires. accounts-api unreachable or answering anything
-  but 200/410 is logged at ERROR and the token honoured (it is still a signed, unexpired
-  credential), then asked about again a minute later.
+  but 200/410 is logged at ERROR, and (v0.9, owner 2026-11-19: "short grace, then refuse") the
+  token is honoured only while its sign-in was confirmed alive in the last 5 minutes
+  (``SESSION_CHECK_GRACE_SECONDS``; asked about again a minute later) - so a blip goes unnoticed -
+  and past that the request is refused: :class:`SessionCheckUnavailableError`, which each API answers
+  503 with its sentence. Nobody is signed out by an outage; a sign-in already known to have ended
+  stays ended.
 * **Telling the two 401s apart** (v0.8, owner 2026-11-19: "Instead of an Unauthorized error, show
   a pop-up that the session has expired"): :func:`session_ended` - the token is ours (expiry
   ignored) and its sign-in has ended - lets an API add ``"reason": "session_expired"`` to its 401
@@ -53,6 +57,11 @@ SESSION_TOUCH_PATH = "/api/internal/session/touch"
 SESSION_TOUCH_SCOPE = "session-touch"
 SESSION_CHECK_SECONDS = 60
 SESSION_TOUCH_TIMEOUT_SECONDS = 5
+#: v0.9: how long after accounts-api last said a sign-in lives that sign-in is still honoured while
+#: accounts-api cannot answer.
+SESSION_CHECK_GRACE_SECONDS = 300
+#: v0.9: what a request refused for that says (each API answers it 503).
+SESSION_CHECK_UNAVAILABLE = "Minty can't check your sign-in just now. Try again in a minute."
 #: Past this many remembered ``sid``s, the ones older than a check are dropped.
 _SESSION_CACHE_LIMIT = 4096
 
@@ -107,6 +116,15 @@ class SessionCheckError(Exception):
     answer other than 200/410). Never read as "ended"."""
 
 
+class SessionCheckUnavailableError(Exception):
+    """v0.9: accounts-api cannot answer and this sign-in was not confirmed alive in the last
+    ``SESSION_CHECK_GRACE_SECONDS``: refuse the request - each API answers 503 with
+    :data:`SESSION_CHECK_UNAVAILABLE` (its ``str``). Never a sign-out."""
+
+    def __init__(self, message: str = SESSION_CHECK_UNAVAILABLE) -> None:
+        super().__init__(message)
+
+
 def touch_over_http(
     accounts_api_url: str, secret: str, sid: str, *, timeout: float = SESSION_TOUCH_TIMEOUT_SECONDS
 ) -> bool:
@@ -136,17 +154,21 @@ def touch_over_http(
 class SessionGate:
     """Whether a token's hub session lives, asked at most once per ``interval`` per ``sid`` in this
     process. ``touch(sid)`` answers True (alive, kept alive), False (ended) or raises
-    :class:`SessionCheckError`."""
+    :class:`SessionCheckError`; then (v0.9) the sign-in is honoured only within ``grace`` of the
+    last time it was confirmed alive, else :class:`SessionCheckUnavailableError`."""
 
     def __init__(
         self,
         *,
         interval: float = SESSION_CHECK_SECONDS,
+        grace: float = SESSION_CHECK_GRACE_SECONDS,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._interval = interval
+        self._grace = grace
         self._clock = clock
-        self._seen: dict[str, tuple[float, bool]] = {}
+        # sid -> (answer good until, the answer, last confirmed alive at or None)
+        self._seen: dict[str, tuple[float, bool, float | None]] = {}
         self._lock = threading.Lock()
 
     def alive(self, sid: str | None, touch: Callable[[str], bool]) -> bool:
@@ -155,22 +177,43 @@ class SessionGate:
         now = self._clock()
         with self._lock:
             seen = self._seen.get(sid)
-        if seen is not None and now - seen[0] < self._interval:
+        if seen is not None and now < seen[0]:
             return seen[1]
+        until = now + self._interval
         try:
             answer = bool(touch(sid))
+            confirmed = now if answer else None
         except SessionCheckError as exc:
+            if seen is not None and not seen[1]:
+                return False  # an ended sign-in never comes back
+            confirmed = seen[2] if seen is not None else None
+            if confirmed is None or now - confirmed >= self._grace:
+                logger.error(
+                    "session check: minty-accounts-api could not answer (%s) and the sign-in was "
+                    "not confirmed in the last %d s; the request is refused (503)",
+                    exc,
+                    self._grace,
+                )
+                raise SessionCheckUnavailableError() from exc
             logger.error(
                 "session check: minty-accounts-api could not answer (%s); the token is honoured "
-                "and asked about again in %d s",
+                "(sign-in confirmed %d s ago) and asked about again in %d s",
                 exc,
+                now - confirmed,
                 self._interval,
             )
             answer = True
+            # honoured on the strength of the last confirmation: never past the grace
+            until = min(until, confirmed + self._grace)
         with self._lock:
             if len(self._seen) >= _SESSION_CACHE_LIMIT:
-                self._seen = {k: v for k, v in self._seen.items() if now - v[0] < self._interval}
-            self._seen[sid] = (now, answer)
+                # still answering, or still able to vouch for a sign-in during an outage
+                self._seen = {
+                    k: v
+                    for k, v in self._seen.items()
+                    if now < v[0] or (v[2] is not None and now - v[2] < self._grace)
+                }
+            self._seen[sid] = (until, answer, confirmed)
         return answer
 
     def forget(self) -> None:
@@ -184,7 +227,8 @@ SESSIONS = SessionGate()
 
 def session_alive(sid: str | None, accounts_api_url: str, secret: str) -> bool:
     """Whether the hub session behind a token's ``sid`` lives (see the module note): False means
-    refuse the token with a 401, which each app answers by handing the person over again."""
+    refuse the token with a 401, which each app answers by handing the person over again;
+    :class:`SessionCheckUnavailableError` (v0.9) means refuse the request with a 503."""
     return SESSIONS.alive(sid, lambda s: touch_over_http(accounts_api_url, secret, s))
 
 
@@ -216,9 +260,12 @@ def session_ended(
     sid = claims.get("sid")
     if not isinstance(sid, str) or not sid:
         return False
-    if touch is None:
-        return not session_alive(sid, accounts_api_url, secret)
-    return not SESSIONS.alive(sid, touch)
+    try:
+        if touch is None:
+            return not session_alive(sid, accounts_api_url, secret)
+        return not SESSIONS.alive(sid, touch)
+    except SessionCheckUnavailableError:
+        return False  # cannot tell: a plain 401, renewed quietly - never a 503 on this path
 
 
 def mark_session_ended(request: Any) -> None:

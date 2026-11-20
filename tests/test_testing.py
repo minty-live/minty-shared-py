@@ -70,7 +70,16 @@ def test_the_sessions_plugin_fakes_the_touch_and_starts_each_test_empty(pytester
         def test_the_cache_was_forgotten(hub_sessions):
             tokens.session_alive("s1", "https://a.test", "k")
             assert hub_sessions.calls == ["s1"]
+
+        def test_an_unreachable_accounts_api_refuses_a_sign_in_never_confirmed(hub_sessions):
+            import pytest
+
+            hub_sessions.unreachable()
+            with pytest.raises(tokens.SessionCheckUnavailableError):
+                tokens.session_alive("s1", "https://a.test", "k")
+            hub_sessions.reachable()
+            assert tokens.session_alive("s1", "https://a.test", "k") is True
         """
     )
     result = pytester.runpytest_subprocess("-p", "no:cacheprovider", "-p", "no:django")
-    result.assert_outcomes(passed=2)
+    result.assert_outcomes(passed=3)
