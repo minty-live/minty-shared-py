@@ -2,9 +2,9 @@
 
 Lifted from Flask's ``blueprints/report/services/expense_ai.py`` (Stage 1, docs/expense_ai/ in
 Minty), whose rules it keeps. A *reader* (minty-petty-cash-api's receipts, minty-payment-request-
-api's invoices) brings only what is its own - the instruction, the cacheable context text, the
-reply's Pydantic model and the check of that reply against the lists it sent - and calls
-``read``. Everything else is here:
+api's invoices) brings only what is its own - the company's lists, through ``minty_shared.ai_prompt``
+(the one prompt both send), and the check of the reply against those lists - and calls ``read``.
+Everything else is here:
 
 * configuration, per reader by prefix (``ReaderConfig("EXPENSE_AI")`` reads ``EXPENSE_AI_ENABLED``,
   ``_MODEL``, ...), read on every call so the kill switch and cut-offs turn without a deploy. The
@@ -17,7 +17,8 @@ reply's Pydantic model and the check of that reply against the lists it sent - a
 * the client (one per process and timeout), the call with at most ONE retry and only for the
   retryable classes, usage and estimated cost, and which model answered;
 * the reply's shape: a field is ``{value, confidence, band, applied}``, and ``applied`` is the
-  page's instruction (a low band is never prefilled).
+  page's instruction (a low band is never prefilled; ``checked`` is a field from a reply with no
+  confidence - the owner's simple prompt, ``minty_shared.ai_prompt`` - always ``medium``).
 
 FAILURE IS ALWAYS SILENT to the person: every error returns "no suggestion" with a ``REASON_*``
 code, and the form works by hand as before. The reply is a suggestion - nothing here writes any
@@ -26,12 +27,12 @@ record. How many reads a company may make is not this module's: the readers ask
 supplies the models to try. Extra ``ai``.
 
 ROUTES. Vertex AI (``GOOGLE_CLOUD_PROJECT``; IAM, a regional residency commitment) is chosen
-whenever a project is set. The route in use is the direct Gemini API, PAID tier (business
-decision, 3 Sep 2026): content is not used to improve Google's products and no human reviewer
-reads it, but there is no region to pin, so documents may be processed outside Singapore. The
-free tier is unusable for customer documents; the tier is stated in configuration
-(``EXPENSE_AI_DIRECT_TIER``) and ``_check_tier_matches_reality`` shouts when Google's own quota
-errors contradict it.
+whenever a project is set - the owner's choice (project ``minty-515207``, ``asia-southeast1``),
+deferred on 2026-11-20. The route in use in both environments is the direct Gemini API on the FREE
+tier, which does not meet "approved providers only" (on it Google may use submitted content and
+human reviewers may read it): decide before customers' documents are read. The tier is stated in
+configuration (``EXPENSE_AI_DIRECT_TIER``) and ``_check_tier_matches_reality`` shouts when Google's
+own quota errors contradict it.
 """
 
 from __future__ import annotations
@@ -297,6 +298,21 @@ def field(
         "confidence": round(conf, 3),
         "band": level,
         "applied": bool(value not in (None, "")) and level != "low",
+    }
+    if extra:
+        out.update(extra)
+    return out
+
+
+def checked(value: Any, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    """One suggestion from a reply that carries no confidence (``minty_shared.ai_prompt``, the
+    owner's simple prompt, 2026-11-20): filled when it has a value, and always in the ``medium``
+    band - marked for the person to check. ``confidence`` stays 0.0 (none was asked)."""
+    out: dict[str, Any] = {
+        "value": value,
+        "confidence": 0.0,
+        "band": "medium",
+        "applied": value not in (None, ""),
     }
     if extra:
         out.update(extra)
