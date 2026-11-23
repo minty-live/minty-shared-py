@@ -38,6 +38,11 @@ call is made), and Google's client finds the service account's key through
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
+import hmac
+import json
 import logging
 import os
 import random
@@ -206,6 +211,70 @@ def checked(value: Any, extra: dict[str, Any] | None = None) -> dict[str, Any]:
     if extra:
         out.update(extra)
     return out
+
+
+# --------------------------------------------------------------------------- a supplier to add
+
+#: How long a reader's new-supplier token holds: a local draft's life (``@minty/shared`` drafts,
+#: 7 days), so a restored draft still adds its contact.
+NEW_SUPPLIER_MAX_AGE_S = 7 * 86400
+NEW_SUPPLIER_MAX_NAME = 100
+_NEW_SUPPLIER_SALT = b"minty-shared.ai.new-supplier"
+
+
+def new_supplier_token(key: str, entity_id: object, name: str, *, now: float | None = None) -> str:
+    """A supplier name the reader read and the company does not have, signed for that company
+    (the user, 2026-11-23: a missing contact is added automatically, when the record is saved -
+    even by someone who may not add contacts by hand). The save endpoint turns it back into the
+    name with ``new_supplier_name``; a name typed by hand carries no token, so the server never
+    takes the page's word that the reader read it. ``key`` is the service's ``SECRET_KEY``."""
+    payload = {
+        "e": str(entity_id),
+        "n": " ".join(str(name).split())[:NEW_SUPPLIER_MAX_NAME],
+        "t": int(time.time() if now is None else now),
+    }
+    body = _b64(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode())
+    return f"{body}.{_b64(_new_supplier_mac(key, body))}"
+
+
+def new_supplier_name(
+    key: str,
+    token: object,
+    entity_id: object,
+    *,
+    max_age_s: int = NEW_SUPPLIER_MAX_AGE_S,
+    now: float | None = None,
+) -> str | None:
+    """The name ``new_supplier_token`` signed, or None when the token is malformed, altered, for
+    another company or older than ``max_age_s``."""
+    if not isinstance(token, str) or token.count(".") != 1:
+        return None
+    body, mac = token.split(".")
+    try:
+        given = base64.urlsafe_b64decode(mac + "=" * (-len(mac) % 4))
+    except (ValueError, binascii.Error):
+        return None
+    if not hmac.compare_digest(given, _new_supplier_mac(key, body)):
+        return None
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+        entity, name, stamp = str(payload["e"]), str(payload["n"]), int(payload["t"])
+    except (ValueError, binascii.Error, KeyError, TypeError):
+        return None
+    age = (time.time() if now is None else now) - stamp
+    if entity != str(entity_id) or not name.strip() or age < -60 or age > max_age_s:
+        return None
+    return name
+
+
+def _new_supplier_mac(key: str, body: str) -> bytes:
+    if not key:
+        raise ValueError("new_supplier_token needs the service's SECRET_KEY")
+    return hmac.new(key.encode() + _NEW_SUPPLIER_SALT, body.encode(), hashlib.sha256).digest()
+
+
+def _b64(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
 
 
 # --------------------------------------------------------------------------- providers

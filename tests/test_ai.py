@@ -607,3 +607,50 @@ def test_the_log_line_names_the_model_that_answered_after_a_failover(monkeypatch
     assert (
         "model=gemini-3.8-flash attempts=gemini-3.5-flash-lite:timeout>gemini-3.8-flash:ok" in line
     )
+
+
+# --------------------------------------------------------------------------- a supplier to add
+
+KEY = "test-secret"
+
+
+def test_new_supplier_token_round_trips_the_name():
+    token = ai.new_supplier_token(KEY, "ent-1", "  Wellcome   Supermarket ")
+    assert ai.new_supplier_name(KEY, token, "ent-1") == "Wellcome Supermarket"
+
+
+def test_new_supplier_token_keeps_the_name_to_100_characters():
+    token = ai.new_supplier_token(KEY, "ent-1", "x" * 150)
+    assert ai.new_supplier_name(KEY, token, "ent-1") == "x" * 100
+
+
+def test_new_supplier_token_is_for_one_company_only():
+    token = ai.new_supplier_token(KEY, "ent-1", "Wellcome")
+    assert ai.new_supplier_name(KEY, token, "ent-2") is None
+
+
+def test_new_supplier_token_refuses_another_key():
+    token = ai.new_supplier_token(KEY, "ent-1", "Wellcome")
+    assert ai.new_supplier_name("other-secret", token, "ent-1") is None
+
+
+def test_new_supplier_token_refuses_an_altered_name():
+    token = ai.new_supplier_token(KEY, "ent-1", "Wellcome")
+    forged = ai.new_supplier_token(KEY, "ent-1", "Someone else").split(".")[0]
+    assert ai.new_supplier_name(KEY, f"{forged}.{token.split('.')[1]}", "ent-1") is None
+
+
+@pytest.mark.parametrize("token", [None, "", "abc", "a.b.c", "!!.??", 42])
+def test_new_supplier_token_refuses_malformed_tokens(token):
+    assert ai.new_supplier_name(KEY, token, "ent-1") is None
+
+
+def test_new_supplier_token_expires_after_seven_days():
+    token = ai.new_supplier_token(KEY, "ent-1", "Wellcome", now=1_000_000)
+    assert ai.new_supplier_name(KEY, token, "ent-1", now=1_000_000 + 7 * 86400) == "Wellcome"
+    assert ai.new_supplier_name(KEY, token, "ent-1", now=1_000_001 + 7 * 86400) is None
+
+
+def test_new_supplier_token_needs_a_key():
+    with pytest.raises(ValueError):
+        ai.new_supplier_token("", "ent-1", "Wellcome")
