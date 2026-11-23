@@ -28,13 +28,12 @@ record. How many reads a company may make is not this module's: the readers ask
 supplies the models to try. Extra ``ai``.
 
 THE ROUTE. Vertex AI only (owner, 2026-11-20; the direct Gemini API is gone): Google Cloud's paid
-terms, IAM instead of an API key, and a regional endpoint - ``asia-southeast1`` (Singapore), where
-the services run. The region is ``ai_policy.location`` (a reader's ``ReaderConfig.location``) -
-it decides which models exist, so it sits beside them; each service's environment names only the
-project (``GOOGLE_CLOUD_PROJECT``, without it no call is made), and Google's client finds the service
-account's key through ``GOOGLE_APPLICATION_CREDENTIALS``. The call is
-``models.generate_content``: Vertex serves ``interactions.create`` only in ``global``, ``us`` and
-``eu``, which would take the document out of the region.
+terms and IAM instead of an API key, on Vertex's ``global`` endpoint (``VERTEX_LOCATION``; owner,
+2026-11-23: no region setting - global serves every model, and Flash-Lite is not served in
+``asia-southeast1``, the region used from 2026-11-20; a request may be processed in any Google
+region). Each service's environment names only the project (``GOOGLE_CLOUD_PROJECT``, without it no
+call is made), and Google's client finds the service account's key through
+``GOOGLE_APPLICATION_CREDENTIALS``. The call is ``models.generate_content``.
 """
 
 from __future__ import annotations
@@ -113,9 +112,6 @@ class ReaderConfig:
     max_output_tokens: int = 4096
     thinking_level: str = "low"
     max_file_mb: int = 10
-    # Vertex AI's region (ai_policy.location): Singapore, where the services run. Recorded on every
-    # read's log line.
-    location: str = "asia-southeast1"
 
     @property
     def max_file_bytes(self) -> int:
@@ -139,22 +135,26 @@ def sniff_mime(data: bytes) -> str | None:
 
 # --------------------------------------------------------------------------- the client
 
-_clients: dict[tuple[str, int], Any] = {}
+#: Where every read is sent: Vertex AI's global endpoint (owner, 2026-11-23). Recorded on every
+#: read's log line.
+VERTEX_LOCATION = "global"
+
+_clients: dict[int, Any] = {}
 _client_lock = threading.Lock()
 
 
-def get_client(timeout_s: int, region: str) -> Any:
-    """One Vertex AI client per process, region and timeout. Raises when the project or the region
-    is not named - no call is ever made somewhere unnamed. The credentials are Google's own lookup
+def get_client(timeout_s: int) -> Any:
+    """One Vertex AI client per process and timeout, on the global endpoint. Raises when the
+    project is not named - no call is ever made unbilled. The credentials are Google's own lookup
     (``GOOGLE_APPLICATION_CREDENTIALS``, the service account's key file)."""
     with _client_lock:
-        if (region, timeout_s) in _clients:
-            return _clients[(region, timeout_s)]
+        if timeout_s in _clients:
+            return _clients[timeout_s]
         name = project()
-        if not name or not region:
+        if not name:
             raise RuntimeError(
                 "Vertex AI is not configured: set GOOGLE_CLOUD_PROJECT (and "
-                "GOOGLE_APPLICATION_CREDENTIALS, the service account's key file), and ai_policy.location."
+                "GOOGLE_APPLICATION_CREDENTIALS, the service account's key file)."
             )
         from google import genai
         from google.genai import types
@@ -166,10 +166,10 @@ def get_client(timeout_s: int, region: str) -> Any:
             retry_options=types.HttpRetryOptions(attempts=1),
         )
         client = genai.Client(
-            vertexai=True, project=name, location=region, http_options=http_options
+            vertexai=True, project=name, location=VERTEX_LOCATION, http_options=http_options
         )
-        logger.info("ai: Vertex AI client ready, project=%s location=%s", name, region)
-        _clients[(region, timeout_s)] = client
+        logger.info("ai: Vertex AI client ready, project=%s location=%s", name, VERTEX_LOCATION)
+        _clients[timeout_s] = client
         return client
 
 
@@ -253,7 +253,7 @@ class GeminiProvider:
 
     def call(self, model: str, parts: DocumentParts, config: ReaderConfig) -> ProviderReply:
         try:
-            client = get_client(config.timeout_seconds, config.location)
+            client = get_client(config.timeout_seconds)
             from google.genai import types
         except Exception as exc:  # noqa: BLE001 - every failure is a reason, never a raise
             logger.error("%s: client unavailable: %s", config.label, exc)
@@ -463,7 +463,7 @@ def read(
         "model_id": chain[0] if chain else None,
         "model_answered": None,
         "attempts": [],
-        "location": config.location,
+        "location": VERTEX_LOCATION,
         "thinking_level": config.thinking_level,
     }
     if not chain:
@@ -672,7 +672,7 @@ def call_model(send: Callable[[], Any], model: str, config: ReaderConfig) -> tup
                     "(%s). Page on-call.",
                     config.label,
                     model,
-                    config.location,
+                    VERTEX_LOCATION,
                 )
                 return None, REASON_PROVIDER_ERROR
             if status is not None and 400 <= status < 500:

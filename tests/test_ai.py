@@ -99,7 +99,7 @@ def _settings(monkeypatch):
 
 def _run(monkeypatch, result, config=CONFIG, document=b"%PDF-1.4 fake", mime="application/pdf"):
     client = FakeClient(result)
-    monkeypatch.setattr(ai, "get_client", lambda timeout_s, region: client)
+    monkeypatch.setattr(ai, "get_client", lambda timeout_s: client)
     extraction = ai.read(
         document,
         mime,
@@ -304,7 +304,7 @@ def test_a_transport_error_twice_is_a_provider_error(monkeypatch):
 
 
 def test_an_unconfigured_client_makes_no_call(monkeypatch):
-    def boom(timeout_s, region):
+    def boom(timeout_s):
         raise RuntimeError("Vertex AI is not configured")
 
     monkeypatch.setattr(ai, "get_client", boom)
@@ -349,7 +349,7 @@ def test_the_log_line_carries_numbers_never_values(monkeypatch, caplog):
     line = caplog.records[-1].getMessage()
     assert line.startswith(
         "test_ai: extract entity=ent-1 user=user-1 model=gemini-3.8-flash "
-        "attempts=gemini-3.8-flash:ok location=asia-southeast1"
+        "attempts=gemini-3.8-flash:ok location=global"
     )
     assert "tokens_in=5000" in line and "status=ok" in line
     assert "4321" not in line and "con-sf" not in line
@@ -372,7 +372,7 @@ def test_the_type_is_sniffed_from_the_bytes(data, expected):
     assert ai.sniff_mime(data) == expected
 
 
-# --- the route: Vertex AI, in the region the environment names -----------------------------------
+# --- the route: Vertex AI, always on its global endpoint (owner, 2026-11-23) -------------------
 
 
 def test_a_reader_is_off_unless_its_settings_say_so():
@@ -380,19 +380,19 @@ def test_a_reader_is_off_unless_its_settings_say_so():
     assert ai.ReaderConfig(label="x", max_file_mb=3).max_file_bytes == 3 * 1024 * 1024
 
 
-@pytest.mark.parametrize(
-    "project, region", [(None, "asia-southeast1"), (" ", "asia-southeast1"), ("minty-515207", "")]
-)
-def test_no_call_without_a_project_and_a_region(monkeypatch, project, region):
+@pytest.mark.parametrize("project", [None, " "])
+def test_no_call_without_a_project(monkeypatch, project):
     if project is None:
         monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
     else:
         monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", project)
     with pytest.raises(RuntimeError, match="Vertex AI is not configured"):
-        ai.get_client(25, region)
+        ai.get_client(25)
 
 
-def test_the_client_is_vertex_ai_in_the_named_region(monkeypatch):
+def test_the_client_is_vertex_ai_on_the_global_endpoint(monkeypatch):
+    """Owner, 2026-11-23: no region setting - global serves every model (Flash-Lite is not in
+    asia-southeast1)."""
     from google import genai
 
     made = {}
@@ -403,26 +403,22 @@ def test_the_client_is_vertex_ai_in_the_named_region(monkeypatch):
 
     monkeypatch.setattr(genai, "Client", Recorder)
     monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "minty-515207")
-    monkeypatch.setenv("AI_LOCATION", "global")  # the old setting: ignored
+    monkeypatch.setenv("AI_LOCATION", "asia-southeast1")  # an old setting: ignored
     assert ai.project() == "minty-515207"
-    client = ai.get_client(25, "asia-southeast1")
+    client = ai.get_client(25)
     assert made["vertexai"] is True
-    assert (made["project"], made["location"]) == ("minty-515207", "asia-southeast1")
+    assert (made["project"], made["location"]) == ("minty-515207", "global")
+    assert ai.VERTEX_LOCATION == "global"
     assert made["http_options"].timeout == 25_000
-    assert ai.get_client(25, "asia-southeast1") is client  # one per process, region and timeout
-    assert ai.get_client(25, "global") is not client
+    assert ai.get_client(25) is client  # one per process and timeout
+    assert ai.get_client(30) is not client
 
 
-def test_the_reader_s_region_is_the_one_called(monkeypatch):
-    """Owner, 2026-11-20: the region is ai_policy.location, carried by the reader's settings."""
+def test_every_read_is_on_the_global_endpoint(monkeypatch):
     asked = []
     client = FakeClient(FakeResponse(_reply()))
-    monkeypatch.setattr(
-        ai, "get_client", lambda timeout_s, region: asked.append((timeout_s, region)) or client
-    )
-    config = ai.ReaderConfig(
-        label="test_ai", enabled=True, timeout_seconds=30, location="us-central1"
-    )
+    monkeypatch.setattr(ai, "get_client", lambda timeout_s: asked.append(timeout_s) or client)
+    config = ai.ReaderConfig(label="test_ai", enabled=True, timeout_seconds=30)
     extraction = ai.read(
         b"%PDF",
         "application/pdf",
@@ -434,13 +430,13 @@ def test_the_reader_s_region_is_the_one_called(monkeypatch):
         validate=_validate,
         models=MODELS,
     )
-    assert asked == [(30, "us-central1")] and extraction.audit["location"] == "us-central1"
-    assert ai.ReaderConfig(label="x").location == "asia-southeast1"
+    assert asked == [30] and extraction.audit["location"] == "global"
+    assert not hasattr(ai.ReaderConfig(label="x"), "location")
 
 
 def test_no_model_named_means_no_call(monkeypatch):
     client = FakeClient(FakeResponse(_reply()))
-    monkeypatch.setattr(ai, "get_client", lambda timeout_s, region: client)
+    monkeypatch.setattr(ai, "get_client", lambda timeout_s: client)
     extraction = ai.read(
         b"%PDF",
         "application/pdf",

@@ -5,9 +5,8 @@ UPDATE (or a command), never a release.
 ``ai_policy`` (one row) holds the models every read tries - ``primary_model``, then
 ``backup_model`` - the readers' settings (owner, 2026-11-20; once each service's environment):
 ``receipt_reader_on`` and ``invoice_reader_on`` (Petty Cash's and Payment Request's switches),
-``timeout_s``, ``max_output_tokens``, ``thinking_level``, ``max_file_mb`` and ``location`` (the
-Vertex AI region), which
-``Policy.reader`` turns into the ``minty_shared.ai.ReaderConfig`` a read uses - and two allowance
+``timeout_s``, ``max_output_tokens``, ``thinking_level`` and ``max_file_mb`` (no region: every read
+is on Vertex's global endpoint, owner 2026-11-23), which ``Policy.reader`` turns into the ``minty_shared.ai.ReaderConfig`` a read uses - and two allowance
 settings:
 
 * ``default_grant`` - the one-time grant every company is given on its first read: ``{"tokens": n,
@@ -46,7 +45,6 @@ from __future__ import annotations
 
 import logging
 import math
-import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -108,7 +106,6 @@ class ReaderSettings:
     max_output_tokens: int = 4096
     thinking_level: str = "low"
     max_file_mb: int = 10
-    location: str = "asia-southeast1"
 
 
 #: The reader columns, in order - what ``load_policy`` reads and ``parse_settings`` accepts.
@@ -117,9 +114,6 @@ SETTING_FIELDS = tuple(ReaderSettings.__dataclass_fields__)
 #: Each number's allowed range - the columns' CHECKs, so a bad value is named before the database
 #: refuses it.
 SETTING_RANGES = {"timeout_s": (5, 120), "max_output_tokens": (256, 65536), "max_file_mb": (1, 20)}
-
-#: A Vertex AI region's shape - ``ck_ai_policy_location``.
-_LOCATION = re.compile(r"[a-z][a-z0-9-]*[a-z0-9]")
 
 
 @dataclass(frozen=True)
@@ -147,7 +141,6 @@ class Policy:
             max_output_tokens=s.max_output_tokens,
             thinking_level=s.thinking_level,
             max_file_mb=s.max_file_mb,
-            location=s.location,
         )
 
 
@@ -287,13 +280,6 @@ def parse_settings(raw: dict[str, Any] | None) -> ReaderSettings:
                 f"thinking_level must be one of {', '.join(ai.THINKING_LEVELS)}, not {level!r}"
             )
         values["thinking_level"] = level
-    if "location" in raw:
-        region = raw["location"]
-        if not isinstance(region, str) or not _LOCATION.fullmatch(region) or len(region) > 40:
-            raise PolicyError(
-                f"location must be a Vertex AI region like asia-southeast1, not {region!r}"
-            )
-        values["location"] = region
     return ReaderSettings(**values)
 
 

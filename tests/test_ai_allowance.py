@@ -109,7 +109,6 @@ def test_each_reader_gets_its_own_switch_and_the_shared_settings():
         "max_output_tokens": 6000,
         "thinking_level": "medium",
         "max_file_mb": 8,
-        "location": "global",
     }
     policy = parse_policy("gemini-3.5-flash", None, [], None, settings)
     receipt, invoice = policy.reader(READER_RECEIPT), policy.reader(READER_INVOICE)
@@ -118,7 +117,6 @@ def test_each_reader_gets_its_own_switch_and_the_shared_settings():
     assert receipt.timeout_seconds == 40 and receipt.max_output_tokens == 6000
     assert receipt.thinking_level == "medium" and receipt.max_file_bytes == 8 * 1024 * 1024
     assert invoice.timeout_seconds == 40
-    assert (receipt.location, invoice.location) == ("global", "global")
 
 
 def test_a_reader_ships_dark_and_keeps_the_columns_defaults():
@@ -129,7 +127,7 @@ def test_a_reader_ships_dark_and_keeps_the_columns_defaults():
         4096,
         "low",
     )
-    assert reader.max_file_mb == 10 and reader.location == "asia-southeast1"
+    assert reader.max_file_mb == 10
 
 
 def test_an_unknown_reader_is_refused():
@@ -148,10 +146,8 @@ def test_an_unknown_reader_is_refused():
         ({"thinking_level": "extreme"}, "thinking_level"),
         ({"receipt_reader_on": "yes"}, "true or false"),
         ({"temperature": 1}, "unknown reader settings"),
-        ({"location": ""}, "location"),
-        ({"location": "Asia Southeast1"}, "location"),
-        ({"location": "asia-southeast1;x"}, "location"),
-        ({"location": 5}, "location"),
+        # owner, 2026-11-23: no region setting - every read is on Vertex's global endpoint
+        ({"location": "global"}, "unknown reader settings"),
     ],
 )
 def test_a_setting_out_of_its_range_is_refused_with_its_reason(raw, says):
