@@ -39,16 +39,24 @@ _INSTRUCTION = (
     'never "".\n'
     "- amount: the total paid, as a number only.\n"
     "- currency: ISO 4217 code, such as HKD or USD.\n"
-    "- date: ISO 8601 date (YYYY-MM-DD).\n"
-    "- description: what was bought, short, in English.\n"
+    # owner, 2026-11-23: a billing period's last day, else the day paid (an invoice: issued)
+    "- date: ISO 8601 date (YYYY-MM-DD). If a billing period is printed, use its last day; "
+    "otherwise the {dated}.\n"
+    # owner, 2026-11-23 (IRD guide): the description is the record of what was paid for, so it is
+    # inferred when the items are not listed, and "" means the document is not enough evidence
+    "- description: what was bought, short, in English. If items are not listed, infer it from "
+    'the supplier and context, and choose account_id to match. "" only if it cannot be inferred.\n'
+    "- description_inferred: true if you inferred the description, false if it is printed.\n"
+    "- document_count: number of separate receipts or invoices in the file.\n"
 )
+_DATED = {"receipt": "payment date", "invoice": "issue date"}
 _DUE_DATE = (
     "- due_date: ISO 8601 date (YYYY-MM-DD); if only terms such as Net 30 are printed, add them "
     'to the invoice date; "" if none.\n'
 )
 _JSON = (
     '{"supplier_contact_id":"","supplier_name":"","account_id":"","amount":0,"currency":"",'
-    '"date":"","description":""'
+    '"date":"","description":"","description_inferred":false,"document_count":1'
 )
 
 
@@ -62,6 +70,8 @@ class SimpleReading(BaseModel):
     currency: str = ""
     date: str = ""
     description: str = ""
+    description_inferred: bool = False
+    document_count: int = 1
 
 
 class InvoiceReading(SimpleReading):
@@ -76,9 +86,10 @@ def reply_model(kind: str) -> type[SimpleReading]:
 
 
 def instruction(kind: str) -> str:
-    """The owner's text, word for word; an invoice adds the due date."""
+    """The owner's text, word for word; an invoice is dated by its issue date and adds the due
+    date."""
     _check(kind)
-    fields = _INSTRUCTION + (_DUE_DATE if kind == INVOICE else "")
+    fields = _INSTRUCTION.replace("{dated}", _DATED[kind]) + (_DUE_DATE if kind == INVOICE else "")
     answer = _JSON + (',"due_date":""' if kind == INVOICE else "") + "}"
     return f"{fields}\nAnswer only with JSON:\n{answer}"
 

@@ -19,20 +19,26 @@ RECEIPT_INSTRUCTION = """Read the attached receipt or invoice and fill in the fi
 - account_id: pick the closest account from the Chart of accounts, even when unsure; never "".
 - amount: the total paid, as a number only.
 - currency: ISO 4217 code, such as HKD or USD.
-- date: ISO 8601 date (YYYY-MM-DD).
-- description: what was bought, short, in English.
+- date: ISO 8601 date (YYYY-MM-DD). If a billing period is printed, use its last day; otherwise the payment date.
+- description: what was bought, short, in English. If items are not listed, infer it from the supplier and context, and choose account_id to match. "" only if it cannot be inferred.
+- description_inferred: true if you inferred the description, false if it is printed.
+- document_count: number of separate receipts or invoices in the file.
 
 Answer only with JSON:
-{"supplier_contact_id":"","supplier_name":"","account_id":"","amount":0,"currency":"","date":"","description":""}"""
+{"supplier_contact_id":"","supplier_name":"","account_id":"","amount":0,"currency":"","date":"","description":"","description_inferred":false,"document_count":1}"""
 
 
 def test_receipt_instruction_is_the_owners_text_word_for_word():
     assert ai_prompt.instruction("receipt") == RECEIPT_INSTRUCTION
 
 
-def test_invoice_instruction_adds_only_the_due_date():
+def test_invoice_instruction_dates_by_the_issue_date_and_adds_the_due_date():
     text = ai_prompt.instruction("invoice")
-    assert text.startswith(RECEIPT_INSTRUCTION.split("\n\nAnswer only")[0])
+    receipt_fields = RECEIPT_INSTRUCTION.split("\n\nAnswer only")[0]
+    # owner, 2026-11-23: a billing period's last day, otherwise the invoice's issue date
+    assert text.startswith(
+        receipt_fields.replace("otherwise the payment date.", "otherwise the issue date.")
+    )
     assert (
         "- due_date: ISO 8601 date (YYYY-MM-DD); if only terms such as Net 30 are printed, add "
         'them to the invoice date; "" if none.\n\nAnswer only with JSON:' in text
@@ -46,6 +52,8 @@ def test_invoice_instruction_adds_only_the_due_date():
         "currency",
         "date",
         "description",
+        "description_inferred",
+        "document_count",
         "due_date",
     ]
 
@@ -145,3 +153,23 @@ def test_checked_fills_every_answered_field_in_the_medium_band():
     }
     assert ai.checked("")["applied"] is False
     assert ai.checked(None)["applied"] is False
+
+
+def test_the_reply_models_carry_the_inferred_flag_and_the_count():
+    # owner, 2026-11-23: a reply that leaves them out reads as one document, description printed
+    reading = ai_prompt.reply_model("receipt").model_validate_json('{"description":"Taxi"}')
+    assert (reading.description_inferred, reading.document_count) == (False, 1)
+
+
+def test_evidence_refusal_several_documents_first_then_no_description():
+    # owner, 2026-11-23 (IRD "A Guide to Keeping Business Records"): what was paid for must be
+    # described, and a file holding several receipts is read one receipt at a time
+    def read(description="Taxi", count=1):
+        return {"description": ai.checked(description), "document_count": count}
+
+    assert ai.evidence_refusal(read()) is None
+    assert ai.evidence_refusal(read(count=2)) == ai.REASON_SEVERAL_DOCUMENTS == "several_documents"
+    assert ai.evidence_refusal(read(description="")) == ai.REASON_NO_DESCRIPTION
+    assert ai.REASON_NO_DESCRIPTION == "no_description"
+    assert ai.evidence_refusal(read(description="  ", count=3)) == "several_documents"
+    assert ai.evidence_refusal({}) == "no_description"  # nothing read: nothing described

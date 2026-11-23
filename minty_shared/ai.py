@@ -73,6 +73,10 @@ REASON_SAFETY_BLOCKED = "safety_blocked"
 REASON_TRUNCATED = "truncated"
 REASON_INVALID_REPLY = "invalid_reply"
 REASON_NO_USABLE_FIELD = "no_usable_field"
+# The model answered, but the document is not one record of a payment (owner, 2026-11-23, IRD "A
+# Guide to Keeping Business Records"). The page says why; the read counts (it was answered).
+REASON_SEVERAL_DOCUMENTS = "several_documents"  # more than one receipt or invoice in the file
+REASON_NO_DESCRIPTION = "no_description"  # what was paid for can't be described or inferred
 
 # Content sniffing: the declared extension and the browser's type are not evidence.
 _MAGIC = (
@@ -211,6 +215,22 @@ def checked(value: Any, extra: dict[str, Any] | None = None) -> dict[str, Any]:
     if extra:
         out.update(extra)
     return out
+
+
+def evidence_refusal(suggestions: dict[str, Any]) -> str | None:
+    """Why an answered read is not one record of a payment, or None (owner, 2026-11-23): several
+    receipts or invoices in the file first (``document_count``), then nothing described or
+    inferred (``description``). The readers answer ``{suggestions: None, reason}`` for either."""
+    try:
+        count = int(suggestions.get("document_count") or 1)
+    except (TypeError, ValueError):
+        count = 1
+    if count > 1:
+        return REASON_SEVERAL_DOCUMENTS
+    description = (suggestions.get("description") or {}).get("value")
+    if not str(description or "").strip():
+        return REASON_NO_DESCRIPTION
+    return None
 
 
 # --------------------------------------------------------------------------- a supplier to add
