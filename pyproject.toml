@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "minty-shared"
-version = "0.13.0"
+version = "0.14.0"
 description = "Minty's shared Python for every backend: logging, config, money, time, tokens, storage, document reading (AI), the roles and permissions, the account rules, and the Django error envelope."
 requires-python = ">=3.13"
 # tzdata: minty_shared.time needs the IANA database, which Windows does not have and a slim
