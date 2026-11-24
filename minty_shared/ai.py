@@ -56,6 +56,8 @@ from typing import Any, Protocol
 
 from pydantic import BaseModel, ValidationError
 
+from minty_shared import images
+
 logger = logging.getLogger("minty-shared.ai")
 
 # One of these accompanies every "no suggestion" answer. For the logs; the page decides what,
@@ -142,7 +144,8 @@ def sniff_mime(data: bytes) -> str | None:
     for magic, mime in _MAGIC:
         if data.startswith(magic):
             return mime
-    return None
+    # an iPhone photo kept as HEIC (the user, 2026-11-24); model_input makes it a JPEG
+    return images.sniff_heif(data)
 
 
 # --------------------------------------------------------------------------- the client

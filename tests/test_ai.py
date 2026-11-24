@@ -364,6 +364,9 @@ def test_the_log_line_carries_numbers_never_values(monkeypatch, caplog):
         (b"%PDF-1.7 ...", "application/pdf"),
         (b"\xff\xd8\xff\xe0 JFIF", "image/jpeg"),
         (b"\x89PNG\r\n\x1a\n rest", "image/png"),
+        # an iPhone photo kept as HEIC (the user, 2026-11-24)
+        (b"\x00\x00\x00\x1cftypheic\x00\x00\x00\x00", "image/heic"),
+        (b"\x00\x00\x00\x1cftypmif1\x00\x00\x00\x00", "image/heif"),
         (b"MZ\x90\x00 an executable named receipt.pdf", None),
         (b"", None),
     ],

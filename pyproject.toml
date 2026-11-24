@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "minty-shared"
-version = "0.18.0"
+version = "0.19.0"
 description = "Minty's shared Python for every backend: logging, config, money, time, tokens, storage, document reading (AI), the roles and permissions, the account rules, and the Django error envelope."
 requires-python = ">=3.13"
 # tzdata: minty_shared.time needs the IANA database, which Windows does not have and a slim
@@ -22,9 +22,14 @@ testing = ["pytest>=8", "pytest-django>=4.8"]
 storage = ["boto3>=1.35,<2.0"]
 # minty_shared.ai + minty_shared.model_input: reading a receipt or invoice with Gemini, and the
 # small copy the model reads. pydantic stays loose: each API pins its own (its OpenAPI contract).
-ai = ["google-genai>=2.22,<3", "pydantic>=2.13,<3", "Pillow>=11.0,<12.0"]
+# pi-heif: the model reads an iPhone photo kept as HEIC too (minty_shared.images).
+ai = ["google-genai>=2.22,<3", "pydantic>=2.13,<3", "Pillow>=11.0,<12.0", "pi-heif>=1.4,<2"]
+# minty_shared.images: a HEIC/HEIF photo as JPEG where it can't be used as it is (a browser that
+# can't draw it, Xero), made on the fly - never stored (the user, 2026-11-24). pi-heif decodes
+# only (no encoder; BSD-3, wheels for manylinux and Windows).
+images = ["Pillow>=11.0,<12.0", "pi-heif>=1.4,<2"]
 dev = [
-  "minty-shared[jwt,django,testing,storage,ai]",
+  "minty-shared[jwt,django,testing,storage,ai,images]",
   "pytest>=8",
   "ruff>=0.6",
   "pyright>=1.1.380",

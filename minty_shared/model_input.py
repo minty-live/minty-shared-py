@@ -22,6 +22,8 @@ from __future__ import annotations
 import io
 import logging
 
+from minty_shared import images
+
 logger = logging.getLogger("minty-shared.model_input")
 
 DEFAULT_MAX_SIDE = 2048
@@ -29,7 +31,9 @@ JPEG_QUALITY = 85
 #: Pillow's decompression-bomb guard, made explicit: an image above this raises on decode.
 MAX_DECODE_PIXELS = 80_000_000
 
-_IMAGES = {"image/jpeg", "image/jpg", "image/pjpeg", "image/png"}
+#: heic/heif: an iPhone photo kept as HEIC (the user, 2026-11-24), decoded through
+#: ``minty_shared.images`` (pi-heif) and sent as JPEG like any other photo.
+_IMAGES = {"image/jpeg", "image/jpg", "image/pjpeg", "image/png", *images.HEIF_MIMES}
 
 
 def prepare_for_model(
@@ -51,6 +55,7 @@ def prepare_for_model(
 def _image(data: bytes, max_side: int) -> bytes:
     from PIL import Image
 
+    images.register()
     Image.MAX_IMAGE_PIXELS = MAX_DECODE_PIXELS
     with Image.open(io.BytesIO(data)) as img:
         w, h = img.size

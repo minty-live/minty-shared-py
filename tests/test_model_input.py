@@ -1,6 +1,7 @@
 """minty_shared.model_input: the small copy a model reads (owner, 2026-11-04)."""
 
 import io
+from pathlib import Path
 
 import pytest
 
@@ -109,6 +110,16 @@ def test_a_png_with_transparency_becomes_a_white_backed_jpeg():
         assert min(r, g, b) > 240
         r, g, b = img.getpixel((20, 100))  # the opaque half keeps its colour
         assert max(r, g, b) < 60
+
+
+@pytest.mark.parametrize("mime", ["image/heic", "image/heif"])
+def test_a_heic_photo_is_sent_as_an_upright_jpeg(mime):
+    # the user, 2026-11-24: an iPhone photo kept as HEIC is read like any other photo
+    pytest.importorskip("pi_heif")
+    heic = (Path(__file__).parent / "fixtures" / "tiny.heic").read_bytes()
+    data, sent = model_input.prepare_for_model(heic, mime)
+    assert sent == "image/jpeg"
+    assert _size(data) == (40, 80)
 
 
 def test_a_multi_page_pdf_is_sent_whole_every_page():
