@@ -6,8 +6,10 @@ UPDATE (or a command), never a release.
 ``backup_model`` - the readers' settings (owner, 2026-11-20; once each service's environment):
 ``receipt_reader_on`` and ``invoice_reader_on`` (Petty Cash's and Payment Request's switches),
 ``timeout_s``, ``max_output_tokens``, ``thinking_level`` and ``max_file_mb`` (no region: every read
-is on Vertex's global endpoint, owner 2026-11-23), which ``Policy.reader`` turns into the ``minty_shared.ai.ReaderConfig`` a read uses - and two allowance
-settings:
+is on Vertex's global endpoint, owner 2026-11-23), which ``Policy.reader`` turns into the ``minty_shared.ai.ReaderConfig`` a read uses - each model's price
+(``model_prices``, the user 2026-11-24: ``{"<model>": {"input": n, "output": n, "cached_input": n}}``,
+USD per 1M tokens; every model the policy names must have one, else reading is OFF) - and two
+allowance settings:
 
 * ``default_grant`` - the one-time grant every company is given on its first read: ``{"tokens": n,
   "reads": n, "days": n}``, each key optional (at least ``tokens`` or ``reads``; ``days`` = it
@@ -74,6 +76,7 @@ PENDING_COUNTS_FOR = timedelta(minutes=5)
 
 _RULE_KEYS = frozenset({"reads", "tokens", "period_days"})
 _GRANT_KEYS = frozenset({"tokens", "reads", "days"})
+_PRICE_KEYS = frozenset({"input", "output", "cached_input"})
 
 
 class PolicyError(ValueError):
@@ -123,6 +126,7 @@ class Policy:
     rules: tuple[Rule, ...]
     default_grant: GrantSpec | None = None
     settings: ReaderSettings = ReaderSettings()
+    prices: tuple[tuple[str, ai.ModelPrice], ...] = ()
 
     @property
     def models(self) -> list[str]:
@@ -141,6 +145,7 @@ class Policy:
             max_output_tokens=s.max_output_tokens,
             thinking_level=s.thinking_level,
             max_file_mb=s.max_file_mb,
+            prices=dict(self.prices),
         )
 
 
@@ -283,24 +288,59 @@ def parse_settings(raw: dict[str, Any] | None) -> ReaderSettings:
     return ReaderSettings(**values)
 
 
+def _price(value: Any, where: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float | Decimal) or value < 0:
+        raise PolicyError(
+            f"{where} must be a price of at least 0 (USD per 1M tokens), not {value!r}"
+        )
+    return float(value)
+
+
+def parse_prices(raw: Any, models: list[str]) -> dict[str, ai.ModelPrice]:
+    """``model_prices`` as each model's ``ai.ModelPrice``, or ``PolicyError`` - also when one of
+    ``models`` (the policy's) has no price, so a read's cost is never left out silently."""
+    if not isinstance(raw, dict):
+        raise PolicyError(
+            'model_prices must be an object like {"<model>": {"input": 0.3, "output": 2.5, '
+            '"cached_input": 0.03}}'
+        )
+    prices = {}
+    for model, entry in raw.items():
+        where = f"model_prices[{model!r}]"
+        if not isinstance(entry, dict) or set(entry) != _PRICE_KEYS:
+            raise PolicyError(f"{where} must have exactly {sorted(_PRICE_KEYS)}")
+        prices[model] = ai.ModelPrice(
+            input=_price(entry["input"], f"{where}.input"),
+            output=_price(entry["output"], f"{where}.output"),
+            cached_input=_price(entry["cached_input"], f"{where}.cached_input"),
+        )
+    missing = [model for model in models if model not in prices]
+    if missing:
+        raise PolicyError(f"model_prices has no price for {', '.join(missing)}")
+    return prices
+
+
 def parse_policy(
     primary_model: Any,
     backup_model: Any,
     limit_rules: Any,
     default_grant: Any = None,
     settings: dict[str, Any] | None = None,
+    model_prices: Any = None,
 ) -> Policy:
     if not isinstance(primary_model, str) or not primary_model.strip():
         raise PolicyError("primary_model is empty")
     backup = (
         backup_model.strip() if isinstance(backup_model, str) and backup_model.strip() else None
     )
+    models = [primary_model.strip()] + ([backup] if backup else [])
     return Policy(
         primary_model.strip(),
         backup,
         parse_rules(limit_rules),
         parse_grant(default_grant),
         parse_settings(settings),
+        tuple(parse_prices(model_prices, models).items()),
     )
 
 
@@ -310,7 +350,14 @@ def load_policy() -> Policy | None:
     row = (
         apps.get_model("minty_db", "AiPolicy")
         .objects.filter(id=1)
-        .values("primary_model", "backup_model", "limit_rules", "default_grant", *SETTING_FIELDS)
+        .values(
+            "primary_model",
+            "backup_model",
+            "limit_rules",
+            "default_grant",
+            "model_prices",
+            *SETTING_FIELDS,
+        )
         .first()
     )
     if row is None:
@@ -326,6 +373,7 @@ def load_policy() -> Policy | None:
             row["limit_rules"],
             row["default_grant"],
             {key: row[key] for key in SETTING_FIELDS},
+            row["model_prices"],
         )
     except PolicyError as exc:
         logger.error("ai: ai_policy is unusable (%s) - AI reading is OFF until it is fixed", exc)

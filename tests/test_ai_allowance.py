@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from minty_shared import ai
 from minty_shared.django.ai_allowance import (
     READER_INVOICE,
     READER_RECEIPT,
@@ -21,6 +22,11 @@ from minty_shared.django.ai_allowance import (
 )
 
 NOW = datetime(2026, 11, 18, 9, 0, tzinfo=UTC)
+#: ai_policy.model_prices as the database holds it (the user, 2026-11-24).
+PRICES = {
+    "gemini-3.5-flash-lite": {"input": 0.30, "output": 2.50, "cached_input": 0.03},
+    "gemini-3.5-flash": {"input": 1.50, "output": 9.00, "cached_input": 0.15},
+}
 
 
 def grant(tokens=None, reads=None, *, used_tokens=0, used_reads=0, expires=None, gid="g1"):
@@ -87,15 +93,57 @@ def test_a_grant_that_cannot_be_used_is_refused_with_its_reason(raw, says):
 
 
 def test_the_models_are_primary_then_backup():
-    policy = parse_policy("gemini-3.5-flash-lite", " gemini-3.8-flash ", [], {"tokens": 10000})
-    assert policy.models == ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
+    policy = parse_policy(
+        "gemini-3.5-flash-lite", " gemini-3.5-flash ", [], {"tokens": 10000}, None, PRICES
+    )
+    assert policy.models == ["gemini-3.5-flash-lite", "gemini-3.5-flash"]
     assert policy.default_grant == GrantSpec(tokens=10000)
-    assert parse_policy("gemini-3.8-flash", "", []).models == ["gemini-3.8-flash"]
+    assert parse_policy("gemini-3.5-flash", "", [], None, None, PRICES).models == [
+        "gemini-3.5-flash"
+    ]
 
 
 def test_a_policy_without_a_primary_model_is_refused():
     with pytest.raises(PolicyError, match="primary_model"):
         parse_policy("  ", None, [])
+
+
+# --- each model's price (the user, 2026-11-24: ai_policy.model_prices) -------------------------
+
+
+def test_every_reader_carries_each_model_s_price():
+    reader = parse_policy("gemini-3.5-flash-lite", None, [], None, None, PRICES).reader(
+        READER_RECEIPT
+    )
+    assert reader.prices["gemini-3.5-flash-lite"] == ai.ModelPrice(0.30, 2.50, 0.03)
+    assert reader.prices["gemini-3.5-flash"] == ai.ModelPrice(1.50, 9.00, 0.15)
+
+
+@pytest.mark.parametrize(
+    "primary, backup, prices, says",
+    [
+        ("gemini-3.8-flash", None, PRICES, "no price for gemini-3.8-flash"),
+        ("gemini-3.5-flash", "gemini-3.8-flash", PRICES, "no price for gemini-3.8-flash"),
+        ("gemini-3.5-flash", None, None, "must be an object"),
+        ("gemini-3.5-flash", None, [], "must be an object"),
+        ("gemini-3.5-flash", None, {"gemini-3.5-flash": {"input": 1.5, "output": 9}}, "exactly"),
+        (
+            "gemini-3.5-flash",
+            None,
+            {"gemini-3.5-flash": {"input": -1, "output": 9, "cached_input": 0.15}},
+            "at least 0",
+        ),
+        (
+            "gemini-3.5-flash",
+            None,
+            {"gemini-3.5-flash": {"input": "1.5", "output": 9, "cached_input": 0.15}},
+            "at least 0",
+        ),
+    ],
+)
+def test_a_policy_whose_cost_cannot_be_worked_out_is_refused(primary, backup, prices, says):
+    with pytest.raises(PolicyError, match=says):
+        parse_policy(primary, backup, [], None, None, prices)
 
 
 # --- the readers' settings (owner, 2026-11-20: ai_policy, not the environment) ----------------
@@ -110,7 +158,7 @@ def test_each_reader_gets_its_own_switch_and_the_shared_settings():
         "thinking_level": "medium",
         "max_file_mb": 8,
     }
-    policy = parse_policy("gemini-3.5-flash", None, [], None, settings)
+    policy = parse_policy("gemini-3.5-flash", None, [], None, settings, PRICES)
     receipt, invoice = policy.reader(READER_RECEIPT), policy.reader(READER_INVOICE)
     assert receipt.enabled is True and invoice.enabled is False
     assert (receipt.label, invoice.label) == ("receipt_ai", "invoice_ai")
@@ -120,7 +168,7 @@ def test_each_reader_gets_its_own_switch_and_the_shared_settings():
 
 
 def test_a_reader_ships_dark_and_keeps_the_columns_defaults():
-    reader = parse_policy("gemini-3.5-flash", None, []).reader(READER_INVOICE)
+    reader = parse_policy("gemini-3.5-flash", None, [], None, None, PRICES).reader(READER_INVOICE)
     assert reader.enabled is False
     assert (reader.timeout_seconds, reader.max_output_tokens, reader.thinking_level) == (
         25,
@@ -132,7 +180,7 @@ def test_a_reader_ships_dark_and_keeps_the_columns_defaults():
 
 def test_an_unknown_reader_is_refused():
     with pytest.raises(ValueError, match="unknown reader"):
-        parse_policy("gemini-3.5-flash", None, []).reader("sales")
+        parse_policy("gemini-3.5-flash", None, [], None, None, PRICES).reader("sales")
 
 
 @pytest.mark.parametrize(
@@ -152,14 +200,14 @@ def test_an_unknown_reader_is_refused():
 )
 def test_a_setting_out_of_its_range_is_refused_with_its_reason(raw, says):
     with pytest.raises(PolicyError, match=says):
-        parse_policy("gemini-3.5-flash", None, [], None, raw)
+        parse_policy("gemini-3.5-flash", None, [], None, raw, PRICES)
 
 
 @pytest.mark.parametrize("on, expected", [(True, True), (False, False)])
 def test_the_page_s_reader_follows_the_reader_s_switch(monkeypatch, on, expected):
     from minty_shared.django import ai_allowance
 
-    policy = parse_policy("gemini-3.5-flash", None, [], None, {"receipt_reader_on": on})
+    policy = parse_policy("gemini-3.5-flash", None, [], None, {"receipt_reader_on": on}, PRICES)
     monkeypatch.setattr(ai_allowance, "load_policy", lambda: policy)
     monkeypatch.setattr(
         ai_allowance, "status", lambda entity_id, p: summarise((), [], [grant(tokens=100)], NOW)

@@ -20,8 +20,15 @@ from pydantic import BaseModel  # noqa: E402
 
 from minty_shared import ai  # noqa: E402
 
-CONFIG = ai.ReaderConfig(label="test_ai", enabled=True)
+#: ai_policy.model_prices' shape (the user, 2026-11-24), USD per 1M tokens.
+PRICES = {
+    "gemini-3.8-flash": ai.ModelPrice(input=0.75, output=3.75, cached_input=0.075),
+    "gemini-3.5-flash-lite": ai.ModelPrice(input=0.30, output=2.50, cached_input=0.03),
+}
+CONFIG = ai.ReaderConfig(label="test_ai", enabled=True, prices=PRICES)
 MODELS = ["gemini-3.8-flash"]
+ENTITY = "3f2a9c1e-0b4d-4e5f-8a6b-7c8d9e0f1a2b"
+LABELS = {"env": "production", "feature": "petty_cash", "entity_id": ENTITY}
 
 
 class Reply(BaseModel):
@@ -110,6 +117,7 @@ def _run(monkeypatch, result, config=CONFIG, document=b"%PDF-1.4 fake", mime="ap
         reply_model=Reply,
         validate=_validate,
         models=MODELS,
+        labels=LABELS,
     )
     return extraction, client
 
@@ -318,6 +326,7 @@ def test_an_unconfigured_client_makes_no_call(monkeypatch):
         reply_model=Reply,
         validate=_validate,
         models=MODELS,
+        labels=LABELS,
     )
     assert extraction.suggestions is None and extraction.reason == ai.REASON_NOT_CONFIGURED
 
@@ -338,8 +347,21 @@ def test_cost_bills_thinking_at_the_output_rate(monkeypatch):
     assert extraction.audit["estimated_cost"] == round(expected, 6)
 
 
-def test_an_unpriced_model_has_no_cost():
-    assert ai.estimate_cost("gemini-unknown", 100, 100) is None
+def test_cached_input_is_charged_at_the_cached_rate():
+    price = ai.ModelPrice(input=0.30, output=2.50, cached_input=0.03)
+    # 5,000 in of which 4,000 cached; 300 out + 200 thinking
+    expected = (1000 * 0.30 + 4000 * 0.03 + 500 * 2.50) / 1_000_000
+    assert ai.estimate_cost(price, 5000, 300, 200, 4000) == round(expected, 6)
+    assert ai.estimate_cost(price, None, 300) is None
+
+
+def test_a_model_without_a_price_records_no_cost_and_says_so(monkeypatch, caplog):
+    caplog.set_level("ERROR", logger="minty-shared.ai")
+    unpriced = ai.ReaderConfig(label="test_ai", enabled=True)
+    extraction, _ = _run(monkeypatch, FakeResponse(_reply()), config=unpriced)
+    assert extraction.answered and "estimated_cost" not in extraction.audit
+    assert extraction.audit["input_tokens"] == 5000  # the tokens are still recorded
+    assert "no price for gemini-3.8-flash" in caplog.text
 
 
 def test_the_log_line_carries_numbers_never_values(monkeypatch, caplog):
@@ -432,6 +454,7 @@ def test_every_read_is_on_the_global_endpoint(monkeypatch):
         reply_model=Reply,
         validate=_validate,
         models=MODELS,
+        labels=LABELS,
     )
     assert asked == [30] and extraction.audit["location"] == "global"
     assert not hasattr(ai.ReaderConfig(label="x"), "location")
@@ -450,8 +473,93 @@ def test_no_model_named_means_no_call(monkeypatch):
         reply_model=Reply,
         validate=_validate,
         models=[],
+        labels=LABELS,
     )
     assert extraction.reason == ai.REASON_NOT_CONFIGURED and client.models.calls == 0
+
+
+# --- request labels: Google's cost per company (the user, 2026-11-24) -------------------------
+
+
+def test_labels_name_the_environment_the_feature_and_the_company(monkeypatch):
+    monkeypatch.delenv("APP_ENV", raising=False)
+    assert ai.request_labels(ENTITY.upper(), ai.FEATURE_PETTY_CASH) == LABELS
+    monkeypatch.setenv("APP_ENV", "development")
+    assert ai.request_labels(ENTITY, ai.FEATURE_PAYMENT_REQUEST) == {
+        "env": "development",
+        "feature": "payment_request",
+        "entity_id": ENTITY,
+    }
+
+
+@pytest.mark.parametrize(
+    ("entity", "feature"),
+    [
+        (ENTITY, "receipts"),  # not a feature
+        ("", ai.FEATURE_PETTY_CASH),
+        ("My Company", ai.FEATURE_PETTY_CASH),  # a name, never: spaces
+        ("a" * 64, ai.FEATURE_PETTY_CASH),  # over Google's 63
+    ],
+)
+def test_a_label_google_would_refuse_is_refused_here(entity, feature):
+    with pytest.raises(ValueError):
+        ai.request_labels(entity, feature)
+
+
+def test_every_vertex_call_carries_the_labels_retries_included(monkeypatch):
+    seen = []
+
+    def answer(calls):
+        if calls == 1:
+            raise ConnectionError("reset")
+        return FakeResponse(_reply())
+
+    client = FakeClient(answer)
+    original = client.models.generate_content
+
+    def record(**kwargs):
+        seen.append(kwargs["config"].labels)
+        return original(**kwargs)
+
+    client.models.generate_content = record
+    monkeypatch.setattr(ai, "get_client", lambda timeout_s: client)
+    extraction = ai.read(
+        b"%PDF",
+        "application/pdf",
+        config=CONFIG,
+        instruction="",
+        prefix_text="",
+        closing_text="",
+        reply_model=Reply,
+        validate=_validate,
+        models=MODELS,
+        labels=LABELS,
+    )
+    assert extraction.answered and seen == [LABELS, LABELS]
+
+
+@pytest.mark.parametrize(
+    "labels",
+    [
+        {"feature": "petty_cash", "entity_id": ENTITY},  # no env
+        {**LABELS, "user_id": "u-1"},  # nothing per person or per receipt
+        {**LABELS, "feature": "Petty Cash"},
+    ],
+)
+def test_a_read_without_the_three_labels_is_a_programming_error(labels):
+    with pytest.raises(ValueError):
+        ai.read(
+            b"%PDF",
+            "application/pdf",
+            config=CONFIG,
+            instruction="",
+            prefix_text="",
+            closing_text="",
+            reply_model=Reply,
+            validate=_validate,
+            models=MODELS,
+            labels=labels,
+        )
 
 
 # --- models: failover and approved providers ---------------------------------------------------
@@ -468,6 +576,7 @@ class FakeProvider:
 
     def call(self, model, parts, config):
         self.calls.append(model)
+        assert parts.labels == LABELS  # the backup model is labelled too
         answer = self.answers[model]
         usage = {"input_tokens": 1000, "output_tokens": 100, "thought_tokens": 0}
         if answer in ai.FAILOVER_REASONS or answer == ai.REASON_SAFETY_BLOCKED:
@@ -488,6 +597,7 @@ def _read_with(monkeypatch, answers, models):
         reply_model=Reply,
         validate=_validate,
         models=models,
+        labels=LABELS,
     )
     return extraction, provider
 
@@ -577,8 +687,9 @@ def test_cost_sums_each_attempt_at_its_own_model_s_price(monkeypatch):
         {"gemini-3.5-flash-lite": ai.REASON_TIMEOUT, "gemini-3.8-flash": _reply()},
         ["gemini-3.5-flash-lite", "gemini-3.8-flash"],
     )
-    lite = ai.estimate_cost("gemini-3.5-flash-lite", 1000, 100, 0)
-    flash = ai.estimate_cost("gemini-3.8-flash", 1000, 100, 0)
+    lite = ai.estimate_cost(PRICES["gemini-3.5-flash-lite"], 1000, 100, 0)
+    flash = ai.estimate_cost(PRICES["gemini-3.8-flash"], 1000, 100, 0)
+    assert lite is not None and flash is not None
     assert extraction.audit["estimated_cost"] == round(lite + flash, 6)
 
 

@@ -57,6 +57,7 @@ from typing import Any, Protocol
 from pydantic import BaseModel, ValidationError
 
 from minty_shared import images
+from minty_shared.config import app_env
 
 logger = logging.getLogger("minty-shared.ai")
 
@@ -90,16 +91,15 @@ _MAGIC = (
     (b"\x89PNG\r\n\x1a\n", "image/png"),
 )
 
-# Model list prices, USD per 1M tokens (input, output), checked 3 Sep 2026 (the Gemini API's; Vertex
-# AI lists the same models at its own prices). An indication for the log's cost field, not an
-# invoice; re-verify at each stage gate.
-PRICING = {
-    "gemini-3.1-pro-preview": (2.00, 12.00),
-    "gemini-3.8-flash": (0.75, 3.75),
-    "gemini-3.5-flash": (1.50, 9.00),
-    "gemini-3.5-flash-lite": (0.30, 2.50),
-    "gemini-2.5-flash": (0.30, 2.50),
-}
+
+@dataclass(frozen=True)
+class ModelPrice:
+    """One model's list price, USD per 1M tokens - ``ai_policy.model_prices``' (the user,
+    2026-11-24; it was a constant here, the Gemini API's prices rather than Vertex AI's)."""
+
+    input: float
+    output: float  # thinking is billed at this rate too
+    cached_input: float  # input tokens served from Gemini's implicit cache
 
 
 # --------------------------------------------------------------------------- configuration
@@ -126,10 +126,48 @@ class ReaderConfig:
     max_output_tokens: int = 4096
     thinking_level: str = "low"
     max_file_mb: int = 10
+    #: Each model's price, by the policy's model name - what a read's estimated cost comes from.
+    prices: dict[str, ModelPrice] = dataclass_field(default_factory=dict)
 
     @property
     def max_file_bytes(self) -> int:
         return self.max_file_mb * 1024 * 1024
+
+
+# --------------------------------------------------------------------------- request labels
+
+#: The two features a read is labelled with - the same words as ``ai_allowance``'s modules.
+FEATURE_PETTY_CASH = "petty_cash"
+FEATURE_PAYMENT_REQUEST = "payment_request"
+FEATURES = (FEATURE_PETTY_CASH, FEATURE_PAYMENT_REQUEST)
+#: Every Vertex call carries exactly these labels (the user, 2026-11-24), so Cloud Billing's
+#: Reports, grouped by label, show Google's own cost per environment, feature and company to set
+#: beside ``ai_read``'s estimate. Only stable values: never a receipt, bill, user or company name.
+LABEL_KEYS = frozenset({"env", "feature", "entity_id"})
+#: Google's rule for a label value: lowercase letters, digits, ``_`` and ``-``, at most 63.
+_LABEL_VALUE = re.compile(r"[a-z0-9_-]{1,63}")
+
+
+def request_labels(entity_id: object, feature: str) -> dict[str, str]:
+    """The labels for one company's read: ``env`` from ``APP_ENV`` (development and production
+    share one Google Cloud project and, until launch, the same companies), ``feature`` one of
+    ``FEATURES``, ``entity_id`` the company's id in lowercase. Raises ValueError on a value
+    Google would refuse - a programming error, never a person's."""
+    labels = {"env": app_env(), "feature": feature, "entity_id": str(entity_id).strip().lower()}
+    _check_labels(labels)
+    return labels
+
+
+def _check_labels(labels: dict[str, str]) -> None:
+    if set(labels) != LABEL_KEYS:
+        raise ValueError(f"AI request labels must be exactly {sorted(LABEL_KEYS)}")
+    if labels["feature"] not in FEATURES:
+        raise ValueError(f"AI request label feature must be one of {FEATURES}")
+    for key, value in labels.items():
+        if not isinstance(value, str) or not _LABEL_VALUE.fullmatch(value):
+            raise ValueError(
+                f"AI request label {key} must be 1-63 lowercase letters, digits, _ or -"
+            )
 
 
 def project() -> str | None:
@@ -317,7 +355,7 @@ def _b64(raw: bytes) -> str:
 class DocumentParts:
     """What a reader asks of a model, in a form every provider can send: the cacheable prefix
     (the company's lists) FIRST, then the document, then the closing; the instruction; the reply's
-    JSON schema."""
+    JSON schema; the request's labels (``request_labels``)."""
 
     prefix_text: str
     document: bytes
@@ -325,6 +363,7 @@ class DocumentParts:
     closing_text: str
     instruction: str
     schema: dict[str, Any]
+    labels: dict[str, str]
 
 
 @dataclass
@@ -380,6 +419,8 @@ class GeminiProvider:
             ),
             # no tools are offered, so nothing for the SDK to call on our behalf
             automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+            # Cloud Billing's cost per environment, feature and company (Vertex AI only)
+            labels=parts.labels,
         )
         response, reason = call_model(
             lambda: client.models.generate_content(model=model, contents=contents, config=settings),
@@ -543,8 +584,12 @@ def read(
     reply_model: type[BaseModel],
     validate: Callable[[Any], dict[str, Any]],
     models: Sequence[str] | None = None,
+    labels: dict[str, str],
 ) -> Extraction:
-    """Read one prepared document. Never raises.
+    """Read one prepared document. Never raises, except ValueError for ``labels`` that are not
+    ``request_labels``' three - a programming error, refused before any call.
+
+    ``labels`` go on every call of the read (each model, each retry).
 
     ``models`` is the list to try in order (the primary, then the backup - ``ai_policy``'s); with
     none, nothing is called (``REASON_NOT_CONFIGURED``). The next model is tried only when one ends
@@ -556,6 +601,7 @@ def read(
     rate, it removes it. ``validate`` turns the parsed reply into the suggestions, accepting an
     id only if it was in the lists sent - the reply is untrusted input, and a value that fails a
     check is dropped, never repaired."""
+    _check_labels(labels)
     started = time.monotonic()
     chain: list[str] = []
     for model in models or []:
@@ -577,6 +623,7 @@ def read(
         closing_text=closing_text,
         instruction=instruction,
         schema=response_schema(reply_model),
+        labels=dict(labels),
     )
     result = Extraction(reason=REASON_NOT_CONFIGURED, audit=audit)
     for index, model in enumerate(chain):
@@ -615,7 +662,7 @@ def _attempt(
         )
         return _attempted(audit, model, Extraction(reason=REASON_NOT_CONFIGURED, audit=audit))
     reply = provider.call(bare, parts, config)
-    _add_usage(audit, bare, reply)
+    _add_usage(audit, model, reply, config)
     if reply.reason or reply.text is None:
         return _attempted(
             audit, model, Extraction(reason=reply.reason or REASON_INVALID_REPLY, audit=audit)
@@ -655,8 +702,11 @@ def _attempted(audit: dict[str, Any], model: str, result: Extraction) -> Extract
     return result
 
 
-def _add_usage(audit: dict[str, Any], model: str, reply: ProviderReply) -> None:
-    """Sum this attempt's tokens and cost into the read's - a failed attempt is billed too."""
+def _add_usage(
+    audit: dict[str, Any], model: str, reply: ProviderReply, config: ReaderConfig
+) -> None:
+    """Sum this attempt's tokens and cost into the read's - a failed attempt is billed too.
+    ``model`` is the policy's name for it, the key of ``config.prices``."""
     if reply.request_id:
         audit["provider_request_id"] = reply.request_id
     usage = reply.usage
@@ -665,8 +715,17 @@ def _add_usage(audit: dict[str, Any], model: str, reply: ProviderReply) -> None:
     for key in ("input_tokens", "output_tokens", "thought_tokens", "cached_tokens"):
         if usage.get(key) is not None:
             audit[key] = int(audit.get(key) or 0) + int(usage[key] or 0)
+    price = config.prices.get(model)
+    if price is None:
+        # the policy refuses a model without a price, so this is a ReaderConfig built by hand
+        logger.error("%s: no price for %s - this read's cost is not recorded", config.label, model)
+        return
     cost = estimate_cost(
-        model, usage.get("input_tokens"), usage.get("output_tokens"), usage.get("thought_tokens")
+        price,
+        usage.get("input_tokens"),
+        usage.get("output_tokens"),
+        usage.get("thought_tokens"),
+        usage.get("cached_tokens"),
     )
     if cost is not None:
         audit["estimated_cost"] = round(float(audit.get("estimated_cost") or 0) + cost, 6)
@@ -809,16 +868,25 @@ def _gemini_usage(response: Any) -> dict[str, int | None]:
 
 
 def estimate_cost(
-    model: str,
+    price: ModelPrice,
     input_tokens: int | None,
     output_tokens: int | None,
     thought_tokens: int | None = None,
+    cached_tokens: int | None = None,
 ) -> float | None:
-    """Thinking is charged at the output rate; leaving it out understated a measured call ~60%."""
-    price = PRICING.get(model)
-    if not price or input_tokens is None or output_tokens is None:
+    """USD for one call at ``price``. Input tokens include the cached ones (Gemini's
+    ``prompt_token_count``), which are charged at ``cached_input`` instead; thinking is charged at
+    the output rate - leaving it out understated a measured call ~60%."""
+    if input_tokens is None or output_tokens is None:
         return None
+    cached = min(max(cached_tokens or 0, 0), input_tokens)
     billable_output = output_tokens + (thought_tokens or 0)
     return round(
-        (input_tokens / 1_000_000) * price[0] + (billable_output / 1_000_000) * price[1], 6
+        (
+            (input_tokens - cached) * price.input
+            + cached * price.cached_input
+            + billable_output * price.output
+        )
+        / 1_000_000,
+        6,
     )

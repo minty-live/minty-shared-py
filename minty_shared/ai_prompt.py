@@ -52,6 +52,13 @@ _INSTRUCTION = (
     "- document_type: receipt, invoice, bank_payment_confirmation, other (not a receipt or "
     "invoice) or unreadable.\n"
 )
+# the user, 2026-11-24 ("separate prompt"): a card slip attached as an INVOICE is warned about; in
+# the receipt reader it stays a receipt, so the line is the invoice reader's only
+_INVOICE_SLIP = (
+    "  bank_payment_confirmation = a bank transfer confirmation or a card payment slip (card "
+    "terminal merchant or customer copy) that shows a payment was made but lists no goods or "
+    "services.\n"
+)
 _DUE_DATE = (
     "- due_date: ISO 8601 date (YYYY-MM-DD); if only terms such as Net 30 are printed, add them "
     'to the invoice date; "" if none.\n'
@@ -90,10 +97,10 @@ def reply_model(kind: str) -> type[SimpleReading]:
 
 
 def instruction(kind: str) -> str:
-    """The user's text, word for word (2026-11-24); an invoice adds the due date, to the field
-    list and to the JSON."""
+    """The user's text, word for word (2026-11-24); an invoice adds what a bank payment
+    confirmation is (a card slip included) and the due date, to the field list and to the JSON."""
     _check(kind)
-    fields = _INSTRUCTION + (_DUE_DATE if kind == INVOICE else "")
+    fields = _INSTRUCTION + (_INVOICE_SLIP + _DUE_DATE if kind == INVOICE else "")
     answer = _JSON + (',"due_date":""' if kind == INVOICE else "") + "}"
     return f"{fields}\nAnswer only with JSON:\n{answer}"
 

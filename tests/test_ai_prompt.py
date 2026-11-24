@@ -30,15 +30,24 @@ Answer only with JSON:
 
 
 def test_receipt_instruction_is_the_users_text_word_for_word():
-    # the user's wording, 2026-11-24
+    # the user's wording, 2026-11-24; a card slip is a receipt here, so no slip line
     assert ai_prompt.instruction("receipt") == RECEIPT_INSTRUCTION
+    assert "card payment slip" not in RECEIPT_INSTRUCTION
 
 
-def test_invoice_instruction_is_the_same_text_plus_the_due_date():
-    # the user, 2026-11-24: one date line for both (no "issue date" for invoices)
+INVOICE_SLIP_LINE = (
+    "  bank_payment_confirmation = a bank transfer confirmation or a card payment slip (card "
+    "terminal merchant or customer copy) that shows a payment was made but lists no goods or "
+    "services.\n"
+)
+
+
+def test_invoice_instruction_is_the_same_text_plus_the_slip_line_and_the_due_date():
+    # the user, 2026-11-24: one date line for both (no "issue date" for invoices); a card slip
+    # attached as an invoice is warned about - Payment Request only ("separate prompt")
     text = ai_prompt.instruction("invoice")
     receipt_fields = RECEIPT_INSTRUCTION.split("\n\nAnswer only")[0]
-    assert text.startswith(receipt_fields + "\n- due_date:")
+    assert text.startswith(receipt_fields + "\n" + INVOICE_SLIP_LINE + "- due_date:")
     assert (
         "- due_date: ISO 8601 date (YYYY-MM-DD); if only terms such as Net 30 are printed, add "
         'them to the invoice date; "" if none.\n\nAnswer only with JSON:' in text
