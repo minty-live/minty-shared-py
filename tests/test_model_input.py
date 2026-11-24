@@ -5,7 +5,6 @@ import io
 import pytest
 
 PIL = pytest.importorskip("PIL")
-pikepdf = pytest.importorskip("pikepdf")
 
 from PIL import Image, JpegImagePlugin  # noqa: E402
 
@@ -27,12 +26,25 @@ def _png_with_alpha() -> bytes:
 
 
 def _pdf(pages: int) -> bytes:
-    pdf = pikepdf.new()
-    for _ in range(pages):
-        pdf.add_blank_page(page_size=(595, 842))
-    buf = io.BytesIO()
-    pdf.save(buf)
-    return buf.getvalue()
+    """A minimal PDF of ``pages`` blank A4 pages, written by hand (no PDF library needed)."""
+    kids = " ".join(f"{3 + n} 0 R" for n in range(pages))
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        f"<< /Type /Pages /Kids [{kids}] /Count {pages} >>".encode(),
+        *[b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] >>" for _ in range(pages)],
+    ]
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += f"{number} 0 obj\n".encode() + body + b"\nendobj\n"
+    xref = len(out)
+    out += f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode()
+    out += b"".join(f"{offset:010d} 00000 n \n".encode() for offset in offsets)
+    out += (
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode()
+    )
+    return bytes(out)
 
 
 def _size(data: bytes) -> tuple[int, int]:
@@ -99,11 +111,12 @@ def test_a_png_with_transparency_becomes_a_white_backed_jpeg():
         assert max(r, g, b) < 60
 
 
-def test_a_multi_page_pdf_is_sent_as_its_first_page_only():
-    data, mime = model_input.prepare_for_model(_pdf(3), "application/pdf")
-    assert mime == "application/pdf"
-    with pikepdf.open(io.BytesIO(data)) as pdf:
-        assert len(pdf.pages) == 1
+def test_a_multi_page_pdf_is_sent_whole_every_page():
+    # the user, 2026-11-24: an invoice's total, tax and bank details are often on its last page
+    original = _pdf(3)
+    data, mime = model_input.prepare_for_model(original, "application/pdf")
+    assert (data, mime) == (original, "application/pdf")
+    assert data.count(b"/Type /Page ") == 3
 
 
 def test_a_one_page_pdf_is_sent_unchanged():
@@ -114,11 +127,18 @@ def test_a_one_page_pdf_is_sent_unchanged():
     )
 
 
-@pytest.mark.parametrize("mime", ["image/jpeg", "image/png", "application/pdf"])
+@pytest.mark.parametrize("mime", ["image/jpeg", "image/png"])
 def test_bytes_that_do_not_decode_are_sent_as_they_are(mime, caplog):
     junk = b"\x89PNG not really" if mime == "image/png" else b"not a real file"
     assert model_input.prepare_for_model(junk, mime) == (junk, mime)
     assert "sending the original" in caplog.text
+
+
+def test_a_pdf_is_never_opened_so_a_broken_one_passes_through_too():
+    assert model_input.prepare_for_model(b"not a real file", "application/pdf") == (
+        b"not a real file",
+        "application/pdf",
+    )
 
 
 def test_other_types_and_empty_input_pass_through():

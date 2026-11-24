@@ -8,7 +8,9 @@ invoice is sent to the model, ``prepare_for_model`` makes the small copy it is b
   (Pillow's ``draft``), so a 48 MP photo is read as 12 MP, never as a 144 MB bitmap; a smaller
   one is decoded once at full size (a 12 MP photo is ~36 MB, freed at once). The model is billed by the image's pixels, not its bytes,
   so there is no byte target and no second pass;
-* a PDF is trimmed to its first page and otherwise sent as it is (a page is billed flat).
+* a PDF is sent whole, every page, as it is (the user, 2026-11-24: an invoice's total, tax and
+  bank details are often on its last page). It is billed per page; the callers hold it to 10 MB
+  (`ai_policy.max_file_mb` and each route's upload check). It is never opened here.
 
 It replaces Flask's ``file_downsize.py``, whose seven-pass, 1 MB-target loop was the CPU and RAM
 cost of reading a receipt. Never raises: on any failure it logs and returns the input unchanged -
@@ -37,8 +39,6 @@ def prepare_for_model(
     if not data:
         return data, mime
     try:
-        if mime == "application/pdf":
-            return first_page_only(data), mime
         if mime in _IMAGES:
             return _image(data, max_side), "image/jpeg"
     except Exception as exc:  # noqa: BLE001 - best effort by design; logged, input returned
@@ -70,18 +70,4 @@ def _image(data: bytes, max_side: int) -> bytes:
             flat = img.convert("RGB")
         out = io.BytesIO()
         flat.save(out, format="JPEG", quality=JPEG_QUALITY)
-        return out.getvalue()
-
-
-def first_page_only(data: bytes) -> bytes:
-    """A multi-page PDF trimmed to page 1; a one-page PDF unchanged. Raises on a broken PDF
-    (``prepare_for_model`` turns that into "send the original")."""
-    import pikepdf
-
-    with pikepdf.open(io.BytesIO(data)) as pdf:
-        if len(pdf.pages) <= 1:
-            return data
-        del pdf.pages[1:]
-        out = io.BytesIO()
-        pdf.save(out)
         return out.getvalue()
