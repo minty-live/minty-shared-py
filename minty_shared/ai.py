@@ -77,6 +77,9 @@ REASON_NO_USABLE_FIELD = "no_usable_field"
 # Guide to Keeping Business Records"). The page says why; the read counts (it was answered).
 REASON_SEVERAL_DOCUMENTS = "several_documents"  # more than one receipt or invoice in the file
 REASON_NO_DESCRIPTION = "no_description"  # what was paid for can't be described or inferred
+#: What the file may be instead of a receipt or invoice (the user, 2026-11-24): the answer's
+#: `document_warning`, a warning beside the suggestions - never a refusal.
+DOCUMENT_WARNINGS = ("bank_payment_confirmation", "other", "unreadable")
 
 # Content sniffing: the declared extension and the browser's type are not evidence.
 _MAGIC = (
@@ -215,6 +218,13 @@ def checked(value: Any, extra: dict[str, Any] | None = None) -> dict[str, Any]:
     if extra:
         out.update(extra)
     return out
+
+
+def document_warning(document_type: object) -> str | None:
+    """The reply's ``document_type`` as a warning for the page, or None: a receipt or an invoice
+    is fine in either reader, and a value the prompt didn't offer is no warning."""
+    value = str(document_type or "").strip().lower()
+    return value if value in DOCUMENT_WARNINGS else None
 
 
 def evidence_refusal(suggestions: dict[str, Any]) -> str | None:

@@ -48,6 +48,9 @@ _INSTRUCTION = (
     'the supplier and context, and choose account_id to match. "" only if it cannot be inferred.\n'
     "- description_inferred: true or false\n"
     "- document_count: number of separate receipts or invoices in the file.\n"
+    # the user, 2026-11-24 (v0.18): what the file is - a warning on the page, never a refusal
+    "- document_type: receipt, invoice, bank_payment_confirmation, other (not a receipt or "
+    "invoice) or unreadable.\n"
 )
 _DUE_DATE = (
     "- due_date: ISO 8601 date (YYYY-MM-DD); if only terms such as Net 30 are printed, add them "
@@ -55,7 +58,8 @@ _DUE_DATE = (
 )
 _JSON = (
     '{"supplier_contact_id":"","supplier_name":"","account_id":"","amount":0,"currency":"",'
-    '"date":"","description":"","description_inferred":false,"document_count":1'
+    '"date":"","description":"","description_inferred":false,"document_count":1,'
+    '"document_type":""'
 )
 
 
@@ -71,6 +75,7 @@ class SimpleReading(BaseModel):
     description: str = ""
     description_inferred: bool = False
     document_count: int = 1
+    document_type: str = ""
 
 
 class InvoiceReading(SimpleReading):

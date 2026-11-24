@@ -23,9 +23,10 @@ RECEIPT_INSTRUCTION = """Read the attached receipt or invoice and fill in the fi
 - description: what was bought, short, in English. If items are not listed, infer it from the supplier and context, and choose account_id to match. "" only if it cannot be inferred.
 - description_inferred: true or false
 - document_count: number of separate receipts or invoices in the file.
+- document_type: receipt, invoice, bank_payment_confirmation, other (not a receipt or invoice) or unreadable.
 
 Answer only with JSON:
-{"supplier_contact_id":"","supplier_name":"","account_id":"","amount":0,"currency":"","date":"","description":"","description_inferred":false,"document_count":1}"""
+{"supplier_contact_id":"","supplier_name":"","account_id":"","amount":0,"currency":"","date":"","description":"","description_inferred":false,"document_count":1,"document_type":""}"""
 
 
 def test_receipt_instruction_is_the_users_text_word_for_word():
@@ -53,6 +54,7 @@ def test_invoice_instruction_is_the_same_text_plus_the_due_date():
         "description",
         "description_inferred",
         "document_count",
+        "document_type",
         "due_date",
     ]
 
@@ -172,3 +174,14 @@ def test_evidence_refusal_several_documents_first_then_no_description():
     assert ai.REASON_NO_DESCRIPTION == "no_description"
     assert ai.evidence_refusal(read(description="  ", count=3)) == "several_documents"
     assert ai.evidence_refusal({}) == "no_description"  # nothing read: nothing described
+
+
+def test_document_warning_names_what_may_be_wrong_and_nothing_else():
+    # the user, 2026-11-24: a warning beside the suggestions, never a refusal
+    for kind in ("bank_payment_confirmation", "other", "unreadable"):
+        assert ai.document_warning(kind) == kind
+    for fine in ("receipt", "invoice", "", None, "selfie", "RECEIPT "):
+        assert ai.document_warning(fine) is None
+    assert ai.document_warning(" Bank_Payment_Confirmation ") == "bank_payment_confirmation"
+    reading = ai_prompt.reply_model("invoice").model_validate_json('{"description":"x"}')
+    assert reading.document_type == ""
