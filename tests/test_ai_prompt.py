@@ -16,7 +16,7 @@ RECEIPT_INSTRUCTION = """Read the attached receipt or invoice and fill in the fi
 
 - supplier_contact_id: pick the same or a similar supplier from the Suppliers list. "" only if none is the same or similar.
 - supplier_name
-- account_id: pick from the Chart of accounts, or "" if none matches.
+- account_id: pick the closest from the Chart of accounts.
 - amount: the total paid, as a number only.
 - currency: ISO 4217 code, such as HKD or USD.
 - date: ISO 8601 date (YYYY-MM-DD). If a billing period is printed, use its last day; otherwise the payment date.
@@ -171,18 +171,18 @@ def test_the_reply_models_carry_the_inferred_flag_and_the_count():
     assert (reading.description_inferred, reading.document_count) == (False, 1)
 
 
-def test_evidence_refusal_several_documents_first_then_no_description():
-    # owner, 2026-11-23 (IRD "A Guide to Keeping Business Records"): what was paid for must be
-    # described, and a file holding several receipts is read one receipt at a time
+def test_evidence_refusal_is_several_documents_only():
+    # the user, 2026-11-25: a file holding several receipts is the only refusal; the description
+    # is not mandatory, so an empty one is answered (the page outlines it)
     def read(description="Taxi", count=1):
         return {"description": ai.checked(description), "document_count": count}
 
     assert ai.evidence_refusal(read()) is None
     assert ai.evidence_refusal(read(count=2)) == ai.REASON_SEVERAL_DOCUMENTS == "several_documents"
-    assert ai.evidence_refusal(read(description="")) == ai.REASON_NO_DESCRIPTION
-    assert ai.REASON_NO_DESCRIPTION == "no_description"
     assert ai.evidence_refusal(read(description="  ", count=3)) == "several_documents"
-    assert ai.evidence_refusal({}) == "no_description"  # nothing read: nothing described
+    assert ai.evidence_refusal(read(description="")) is None
+    assert ai.evidence_refusal({}) is None
+    assert not hasattr(ai, "REASON_NO_DESCRIPTION")
 
 
 def test_document_warning_names_what_may_be_wrong_and_nothing_else():
