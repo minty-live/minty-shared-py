@@ -369,7 +369,7 @@ def test_a_retried_call_is_counted_as_unanswered_and_logged(monkeypatch, caplog)
 
     extraction, _ = _run(monkeypatch, flaky)
     assert extraction.answered and extraction.audit["calls_unanswered"] == 1
-    assert extraction.attempts_text() == "gemini-3.8-flash:ok(1 unanswered)"
+    assert extraction.attempts_text() == "gemini-3.8-flash:ok(1 unanswered: 503)"
     line = next(r.getMessage() for r in caplog.records if "call not answered" in r.getMessage())
     assert "model=gemini-3.8-flash call=1 status=503" in line and "elapsed_ms=" in line
     assert "request_id=None" in line
@@ -378,13 +378,16 @@ def test_a_retried_call_is_counted_as_unanswered_and_logged(monkeypatch, caplog)
 def test_both_calls_lost_are_both_counted(monkeypatch):
     extraction, _ = _run(monkeypatch, ConnectionError("reset"))
     assert extraction.audit["calls_unanswered"] == 2 and extraction.tokens() == 0
-    assert extraction.attempts_text() == "gemini-3.8-flash:provider_error(2 unanswered)"
+    assert (
+        extraction.attempts_text()
+        == "gemini-3.8-flash:provider_error(2 unanswered: ConnectionError ConnectionError)"
+    )
 
 
 def test_a_timeout_is_one_unanswered_call(monkeypatch):
     extraction, _ = _run(monkeypatch, TimeoutError("deadline exceeded"))
     assert extraction.audit["calls_unanswered"] == 1
-    assert extraction.attempts_text() == "gemini-3.8-flash:timeout(1 unanswered)"
+    assert extraction.attempts_text() == "gemini-3.8-flash:timeout(1 unanswered: TimeoutError)"
 
 
 def test_the_request_id_is_taken_from_the_error_response_when_google_sends_one(monkeypatch, caplog):
@@ -861,3 +864,10 @@ def test_new_supplier_token_expires_after_seven_days():
 def test_new_supplier_token_needs_a_key():
     with pytest.raises(ValueError):
         ai.new_supplier_token("", "ent-1", "Wellcome")
+
+
+def test_a_429_s_status_is_kept_apart_from_a_server_error(monkeypatch):
+    """The user, 2026-11-26: a failure rate per week by kind - 429, 5xx, timeout, bad reply."""
+    extraction, _ = _run(monkeypatch, _api_error(429, "quota exceeded"))
+    assert extraction.reason == ai.REASON_RATE_LIMITED
+    assert extraction.attempts_text() == "gemini-3.8-flash:rate_limited(2 unanswered: 429 429)"

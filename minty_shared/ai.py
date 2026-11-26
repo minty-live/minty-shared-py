@@ -389,6 +389,9 @@ class ProviderReply:
     #: Calls sent that got no reply (an error or a timeout, the retry included). Google may bill
     #: one it processed, but no reply means no token count - each is logged by ``call_model``.
     unanswered: int = 0
+    #: Each of those calls' status, in order: the HTTP code (``"503"``, ``"429"``) or the error's
+    #: type (``"TimeoutError"``) - kept in ``ai_read.attempts`` for a failure rate by kind.
+    unanswered_statuses: tuple[str, ...] = ()
 
 
 class Provider(Protocol):
@@ -442,12 +445,16 @@ class GeminiProvider:
             config,
             unanswered=unanswered,
         )
+        statuses = tuple(str(r["status"]) for r in unanswered)
         if response is None:
-            return ProviderReply(reason=reason, unanswered=len(unanswered))
+            return ProviderReply(
+                reason=reason, unanswered=len(unanswered), unanswered_statuses=statuses
+            )
         reply = ProviderReply(
             usage=_gemini_usage(response),
             request_id=getattr(response, "response_id", None),
             unanswered=len(unanswered),
+            unanswered_statuses=statuses,
         )
         blocked = _name(getattr(getattr(response, "prompt_feedback", None), "block_reason", None))
         if blocked:
@@ -684,7 +691,7 @@ def _attempt(
         return _attempted(audit, model, Extraction(reason=REASON_NOT_CONFIGURED, audit=audit))
     reply = provider.call(bare, parts, config)
     _add_usage(audit, model, reply, config)
-    lost = reply.unanswered
+    lost = reply.unanswered_statuses
     if reply.reason or reply.text is None:
         return _attempted(
             audit,
@@ -722,12 +729,14 @@ def _attempt(
 
 
 def _attempted(
-    audit: dict[str, Any], model: str, result: Extraction, unanswered: int = 0
+    audit: dict[str, Any], model: str, result: Extraction, unanswered: tuple[str, ...] = ()
 ) -> Extraction:
-    """Grow the chain: ``model:outcome``, plus ``(N unanswered)`` when calls sent for this model
-    got no reply - possibly billed by Google, never counted in the tokens."""
+    """Grow the chain: ``model:outcome``, plus ``(N unanswered: <status> ...)`` when calls sent for
+    this model got no reply - possibly billed by Google, never counted in the tokens. The statuses
+    (``503``, ``429``, ``TimeoutError``) tell a 5xx from a 4xx from a dropped connection, which
+    ``reason`` alone (``provider_error``) does not."""
     outcome = "ok" if audit.get("model_answered") == model else (result.reason or "failed")
-    lost = f"({unanswered} unanswered)" if unanswered else ""
+    lost = f"({len(unanswered)} unanswered: {' '.join(unanswered)})" if unanswered else ""
     audit["attempts"].append(f"{model}:{outcome}{lost}")
     return result
 

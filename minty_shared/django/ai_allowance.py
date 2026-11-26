@@ -549,13 +549,34 @@ def status(entity_id: Any, policy: Policy) -> Allowance:
     return summarise(policy.rules, [by_period[r.period_days] for r in policy.rules], grants, now)
 
 
-def reader_status(reader: str, entity_id: Any) -> dict[str, Any]:
+def reader_status(reader: str, entity_id: Any, user_id: Any = None) -> dict[str, Any]:
     """What a page needs to draw the read button: ``enabled`` (a usable policy AND ``reader``'s
-    switch in it) and the allowance. A switched-off reader sends no numbers."""
+    switch in it) and the allowance. A switched-off reader sends no numbers. With ``user_id`` (the
+    signed-in person, from their verified token - never the client's word) also ``first_read_at``,
+    which sizes the reading cat (the user, 2026-11-26)."""
     policy = load_policy()
     if policy is None or not policy.reader(reader).enabled:
         return {"enabled": False}
-    return {"enabled": True, **status(entity_id, policy).as_dict()}
+    answer = {"enabled": True, **status(entity_id, policy).as_dict()}
+    if user_id is not None:
+        answer["first_read_at"] = first_read_at(user_id)
+    return answer
+
+
+def first_read_at(user_id: Any) -> str | None:
+    """When this person's first read was answered - any company, either reader - as ISO, or None
+    (never read, or nobody signed in). The page shows the large reading cat for 24 hours from it,
+    the small one after (the user, 2026-11-26: worked out from ``ai_read``, no column of its own).
+    ``ai_read`` has no ``user_id`` index; a few hundred rows today, so the plain query is fine -
+    an index is a schema change, asked for when the table grows."""
+    if user_id is None:
+        return None
+    first = (
+        apps.get_model("minty_db", "AiRead")
+        .objects.filter(user_id=user_id, status="ok")
+        .aggregate(first=Min("created_at"))["first"]
+    )
+    return first.isoformat() if first else None
 
 
 # --------------------------------------------------------------------------- grants and reads

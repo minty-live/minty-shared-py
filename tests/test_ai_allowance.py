@@ -218,6 +218,33 @@ def test_the_page_s_reader_follows_the_reader_s_switch(monkeypatch, on, expected
     assert ai_allowance.reader_status(READER_INVOICE, "ent-1") == {"enabled": False}
 
 
+def test_the_page_s_reader_says_when_this_person_first_read(monkeypatch):
+    """The user, 2026-11-26: the large reading cat for a person's first day, the small one after."""
+    from minty_shared.django import ai_allowance
+
+    policy = parse_policy("gemini-3.5-flash", None, [], None, {"receipt_reader_on": True}, PRICES)
+    monkeypatch.setattr(ai_allowance, "load_policy", lambda: policy)
+    monkeypatch.setattr(
+        ai_allowance, "status", lambda entity_id, p: summarise((), [], [grant(tokens=100)], NOW)
+    )
+    asked = []
+    monkeypatch.setattr(
+        ai_allowance,
+        "first_read_at",
+        lambda user_id: asked.append(user_id) or "2026-11-25T03:00:00+00:00",
+    )
+    status = ai_allowance.reader_status(READER_RECEIPT, "ent-1", "user-1")
+    assert status["first_read_at"] == "2026-11-25T03:00:00+00:00" and asked == ["user-1"]
+    # a switched-off reader sends nothing about the person
+    assert ai_allowance.reader_status(READER_INVOICE, "ent-1", "user-1") == {"enabled": False}
+
+
+def test_no_one_signed_in_has_no_first_read():
+    from minty_shared.django import ai_allowance
+
+    assert ai_allowance.first_read_at(None) is None
+
+
 def test_no_usable_policy_means_no_reader(monkeypatch):
     from minty_shared.django import ai_allowance
 
