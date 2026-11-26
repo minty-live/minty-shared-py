@@ -1,8 +1,10 @@
-"""Files in Backblaze B2 through the S3 API, stored exactly as uploaded (owner, 2026-11-04).
+"""Files in Backblaze B2 through the S3 API.
 
 One upload for every backend that stores an attachment (minty-petty-cash-api's receipts,
-minty-payment-request-api's invoices and bank slips): no downsizing and no conversion, so the
-bytes in B2 are the bytes the person chose, under the content type they arrived with.
+minty-payment-request-api's invoices and bank slips). ``put_file`` stores the bytes it is given,
+under the content type it is given. Since 2026-11-26 (the user) a photo is compressed BEFORE it
+gets here - ``minty_shared.images.for_storage`` - and documents arrive as uploaded (it replaced
+the owner's 2026-11-04 "stored exactly as uploaded").
 
 * ``make_client`` - the boto3 S3 client, built the same way everywhere (s3v4 signatures).
 * ``put_file`` - one object, retried twice (1 s, 2 s); a final failure raises ``StorageError``.

@@ -147,3 +147,105 @@ def test_a_heic_is_known_by_its_bytes_whatever_it_was_called():
 )
 def test_types_xero_takes_go_unchanged(data, mime, name):
     assert images.for_xero(data, mime, name) == (data, mime, name)
+
+
+# --------------------------------------------------------------------------- for_storage
+
+
+def _photo(width, height, fmt="JPEG", **save) -> bytes:
+    """A photo-like image (noise compresses like a camera picture, not like a flat colour)."""
+    import random
+
+    rnd = random.Random(width * 7 + height)
+    img = Image.frombytes("RGB", (width, height), rnd.randbytes(width * height * 3))
+    buf = io.BytesIO()
+    img.save(buf, format=fmt, **save)
+    return buf.getvalue()
+
+
+def test_a_large_jpeg_is_stored_as_a_2048_jpeg():
+    original = _photo(4032, 3024, quality=95)
+    data, mime, name = images.for_storage(original, "image/jpeg", "IMG_1.JPG")
+    img = _decoded(data)
+    assert (img.format, img.size, mime, name) == ("JPEG", (2048, 1536), "image/jpeg", "IMG_1.jpg")
+    assert len(data) < len(original)
+
+
+def test_a_small_jpeg_that_would_not_shrink_is_kept_as_it_is():
+    original = _photo(800, 600, quality=60)
+    assert images.for_storage(original, "image/jpeg", "a.jpeg") == (
+        original,
+        "image/jpeg",
+        "a.jpeg",
+    )
+
+
+def test_a_heic_is_stored_as_an_upright_jpeg_named_jpg():
+    data, mime, name = images.for_storage(HEIC, "image/heic", "IMG_1234.HEIC")
+    img = _decoded(data)
+    assert (img.format, img.size, mime, name) == ("JPEG", (40, 80), "image/jpeg", "IMG_1234.jpg")
+
+
+def test_a_heic_is_known_by_its_bytes_when_stored():
+    data, mime, name = images.for_storage(HEIC, "application/octet-stream", "slip.bin")
+    assert (_decoded(data).format, mime, name) == ("JPEG", "image/jpeg", "slip.jpg")
+
+
+@pytest.mark.parametrize(
+    ("fmt", "mime"), [("WEBP", "image/webp"), ("BMP", "image/bmp"), ("TIFF", "image/tiff")]
+)
+def test_types_xero_refuses_or_that_are_huge_become_jpeg(fmt, mime):
+    data, out_mime, name = images.for_storage(_photo(300, 200, fmt=fmt), mime, "scan.x")
+    assert (_decoded(data).format, out_mime, name) == ("JPEG", "image/jpeg", "scan.jpg")
+
+
+def test_a_photo_saved_as_png_becomes_a_smaller_jpeg():
+    original = _photo(3000, 2000, fmt="PNG")
+    data, mime, name = images.for_storage(original, "image/png", "photo.png")
+    assert (_decoded(data).size, mime, name) == ((2048, 1365), "image/jpeg", "photo.jpg")
+    assert len(data) < len(original)
+
+
+def test_a_screenshot_png_that_jpeg_would_not_shrink_stays_png():
+    original = _png(1200, 800, colour=(255, 255, 255))
+    assert images.for_storage(original, "image/png", "shot.png") == (
+        original,
+        "image/png",
+        "shot.png",
+    )
+
+
+@pytest.mark.parametrize(
+    ("data", "mime", "name"),
+    [
+        (b"%PDF-1.7 pdf bytes", "application/pdf", "a.pdf"),
+        (b"GIF89a gif bytes", "image/gif", "a.gif"),
+        (b"<svg></svg>", "image/svg+xml", "a.svg"),
+        (b"<html></html>", "text/html", "a.html"),
+        (b"a,b\n1,2", "text/csv", "a.csv"),
+    ],
+)
+def test_documents_are_stored_as_uploaded(data, mime, name):
+    assert images.for_storage(data, mime, name) == (data, mime, name)
+
+
+@pytest.mark.parametrize("mime", ["image/jpeg", "image/png", "image/heic", "image/webp"])
+def test_a_photo_that_does_not_decode_is_refused(mime):
+    with pytest.raises(images.ImageError):
+        images.for_storage(b"\xff\xd8\xff\xe0 not really a photo", mime, "a.jpg")
+
+
+def test_a_big_jpeg_is_decoded_at_a_reduced_scale(monkeypatch):
+    """The memory guard: a JPEG at least twice the cap is read through draft() (1/2, 1/4, 1/8)."""
+    from PIL import JpegImagePlugin
+
+    asked = []
+    real = JpegImagePlugin.JpegImageFile.draft
+
+    def spy(self, mode, size):
+        asked.append(size)
+        return real(self, mode, size)
+
+    monkeypatch.setattr(JpegImagePlugin.JpegImageFile, "draft", spy)
+    data, _, _ = images.for_storage(_photo(4400, 3300, quality=90), "image/jpeg", "big.jpg")
+    assert asked and _decoded(data).size == (2048, 1536)

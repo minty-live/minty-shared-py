@@ -1,9 +1,13 @@
-"""HEIC/HEIF photos: stored as uploaded, turned into JPEG only where it can't be used as it is
-(the user, 2026-11-24).
+"""Photos: compressed for storage, HEIC/HEIF turned into JPEG.
+
+``for_storage`` (the user, 2026-11-26) is what an upload keeps in B2: a photo (JPEG, HEIC/HEIF,
+WebP, BMP, TIFF, and a PNG when that is smaller) as an upright JPEG, at most 2048 px on its
+longest side, quality 85, no EXIF; documents exactly as uploaded. Every type it stores is one
+Xero takes, so the stored file is what is shown and published.
 
 An iPhone photo can arrive as HEIC (from the Files app, a Mac, a PC copy; an Android phone set to
-"high-efficiency" photos saves HEIF). It is stored exactly as uploaded, like every attachment
-(``minty_shared.storage``) - no copy is kept. A JPEG is made on the fly, only when it is needed:
+"high-efficiency" photos saves HEIF). Since 2026-11-26 it is stored as JPEG. HEIC uploaded
+between 2026-11-24 and then is still in B2 as it was, so a JPEG is made on the fly for those:
 
 * to SHOW it, when the person's browser can't draw HEIC (Safari 17+ can; Chrome, Edge, Firefox
   and Android can't) - the services' preview routes answer ``?as=jpeg`` with ``to_jpeg``;
@@ -34,6 +38,13 @@ DEFAULT_MAX_SIDE = 4096
 JPEG_QUALITY = 90
 #: Pillow's decompression-bomb guard, made explicit (as in ``model_input``).
 MAX_DECODE_PIXELS = 80_000_000
+#: A stored photo (``for_storage``; the user, 2026-11-26): the AI copy's size, ~0.3-1 MB.
+STORE_MAX_SIDE = 2048
+STORE_QUALITY = 85
+
+_JPEG_MIMES = frozenset({JPEG, "image/jpg", "image/pjpeg"})
+#: Stored as JPEG whatever the size: Xero refuses WebP (and HEIC); BMP/TIFF are uncompressed.
+_ALWAYS_JPEG = frozenset({"image/webp", "image/bmp", "image/x-ms-bmp", "image/tiff"})
 
 # ISO base media file "ftyp" major brands (ISO/IEC 23008-12). AVIF ("avif") is not HEIC.
 _HEIC_BRANDS = frozenset({b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"hevm", b"hevs"})
@@ -79,13 +90,25 @@ def register() -> None:
 
 def to_jpeg(data: bytes, *, max_side: int = DEFAULT_MAX_SIDE, quality: int = JPEG_QUALITY) -> bytes:
     """``data`` (any image Pillow or pi-heif opens) as an upright JPEG, at most ``max_side`` on its
-    longest side, transparency flattened onto white. Raises ``ImageError`` when it won't decode."""
+    longest side, transparency flattened onto white, no EXIF kept. Raises ``ImageError`` when it
+    won't decode."""
+    return _encode(data, max_side, quality)[0]
+
+
+def _encode(data: bytes, max_side: int, quality: int) -> tuple[bytes, tuple[int, int]]:
+    """``(jpeg, original size)``. A JPEG at least twice the final size is decoded straight at 1/2,
+    1/4 or 1/8 scale (Pillow's ``draft``, as in ``model_input``), so a 48 MP photo never becomes a
+    144 MB bitmap on a 512 MB server."""
     from PIL import Image, ImageOps
 
     register()
     Image.MAX_IMAGE_PIXELS = MAX_DECODE_PIXELS
     try:
         with Image.open(io.BytesIO(data)) as opened:
+            original = opened.size
+            sw, sh = original
+            scale = min(1.0, max_side / max(sw, sh))
+            opened.draft("RGB", (max(1, round(sw * scale)), max(1, round(sh * scale))))
             img = ImageOps.exif_transpose(opened)
             w, h = img.size
             scale = min(1.0, max_side / max(w, h))
@@ -100,7 +123,7 @@ def to_jpeg(data: bytes, *, max_side: int = DEFAULT_MAX_SIDE, quality: int = JPE
                 flat = img.convert("RGB")
             out = io.BytesIO()
             flat.save(out, format="JPEG", quality=quality)
-            return out.getvalue()
+            return out.getvalue(), original
     except Exception as exc:  # noqa: BLE001 - any decoder failure is the same refusal
         raise ImageError(f"The image could not be decoded: {exc}") from exc
 
@@ -129,4 +152,29 @@ def for_xero(data: bytes, mime: str, name: str) -> tuple[bytes, str, str]:
     named ``<stem>.jpg``, because Xero takes no HEIC; any other file exactly as it is."""
     if is_heif(mime) or sniff_heif(data[:16]):
         return to_jpeg(data), JPEG, jpeg_name(name)
+    return data, mime, name
+
+
+def for_storage(data: bytes, mime: str, name: str) -> tuple[bytes, str, str]:
+    """``(bytes, mime, name)`` to keep in B2 for an upload (the user, 2026-11-26): photos are
+    stored as a JPEG at most ``STORE_MAX_SIDE`` on the longest side, in a type Xero takes, so the
+    stored file is what is shown and what is published.
+
+    * HEIC/HEIF (by type or bytes), WebP, BMP, TIFF: always the JPEG (Xero takes no HEIC or WebP;
+      BMP and TIFF are many times the size);
+    * JPEG: the JPEG, except that one already within the cap is kept when re-saving would not
+      make it smaller (no second loss for nothing);
+    * PNG: the JPEG only when it is smaller - a sharp screenshot stays PNG;
+    * anything else (PDF, Office files, CSV, text, HTML, GIF, SVG): exactly as uploaded.
+
+    A photo that won't decode raises ``ImageError``: it is refused, never stored broken."""
+    kind = (mime or "").strip().lower()
+    if is_heif(kind) or sniff_heif(data[:16]) or kind in _ALWAYS_JPEG:
+        return _encode(data, STORE_MAX_SIDE, STORE_QUALITY)[0], JPEG, jpeg_name(name)
+    if kind in _JPEG_MIMES or kind == "image/png":
+        jpeg, (w, h) = _encode(data, STORE_MAX_SIDE, STORE_QUALITY)
+        within_cap = max(w, h) <= STORE_MAX_SIDE
+        if len(jpeg) >= len(data) and (within_cap or kind == "image/png"):
+            return data, mime, name
+        return jpeg, JPEG, jpeg_name(name)
     return data, mime, name

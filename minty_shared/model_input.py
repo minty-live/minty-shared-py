@@ -1,6 +1,6 @@
 """The copy of a document a model reads - never the stored file (owner, 2026-11-04).
 
-Stored attachments reach B2 exactly as uploaded (``minty_shared.storage``). Before a receipt or
+The reader works on the uploaded bytes, never on B2's stored copy. Before a receipt or
 invoice is sent to the model, ``prepare_for_model`` makes the small copy it is billed for:
 
 * an image is capped at ``max_side`` on its longest side, flattened onto white and saved ONCE
