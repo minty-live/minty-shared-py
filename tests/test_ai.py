@@ -311,6 +311,54 @@ def test_a_transport_error_twice_is_a_provider_error(monkeypatch):
     assert extraction.reason == ai.REASON_PROVIDER_ERROR and client.models.calls == 2
 
 
+# --- calls sent with no reply: Google may bill them, so they are counted (the user, 2026-11-26) --
+
+
+def test_a_retried_call_is_counted_as_unanswered_and_logged(monkeypatch, caplog):
+    caplog.set_level("WARNING", logger="minty-shared.ai")
+
+    def flaky(call_number):
+        if call_number == 1:
+            raise _api_error(503, "unavailable")
+        return FakeResponse(_reply())
+
+    extraction, _ = _run(monkeypatch, flaky)
+    assert extraction.answered and extraction.audit["calls_unanswered"] == 1
+    assert extraction.attempts_text() == "gemini-3.8-flash:ok(1 unanswered)"
+    line = next(r.getMessage() for r in caplog.records if "call not answered" in r.getMessage())
+    assert "model=gemini-3.8-flash call=1 status=503" in line and "elapsed_ms=" in line
+    assert "request_id=None" in line
+
+
+def test_both_calls_lost_are_both_counted(monkeypatch):
+    extraction, _ = _run(monkeypatch, ConnectionError("reset"))
+    assert extraction.audit["calls_unanswered"] == 2 and extraction.tokens() == 0
+    assert extraction.attempts_text() == "gemini-3.8-flash:provider_error(2 unanswered)"
+
+
+def test_a_timeout_is_one_unanswered_call(monkeypatch):
+    extraction, _ = _run(monkeypatch, TimeoutError("deadline exceeded"))
+    assert extraction.audit["calls_unanswered"] == 1
+    assert extraction.attempts_text() == "gemini-3.8-flash:timeout(1 unanswered)"
+
+
+def test_the_request_id_is_taken_from_the_error_response_when_google_sends_one(monkeypatch, caplog):
+    caplog.set_level("WARNING", logger="minty-shared.ai")
+    error = _api_error(400, "bad")
+    error.response = SimpleNamespace(headers={"x-request-id": "req-42"})
+    _run(monkeypatch, error)
+    assert "request_id=req-42" in caplog.text
+
+
+def test_an_answered_call_counts_nothing_unanswered(monkeypatch, caplog):
+    caplog.set_level("INFO", logger="minty-shared.ai")
+    extraction, _ = _run(monkeypatch, FakeResponse(_reply()))
+    assert "calls_unanswered" not in extraction.audit
+    assert extraction.attempts_text() == "gemini-3.8-flash:ok"
+    ai.log_read(CONFIG, extraction, entity_id="ent-1", user_id="user-1")
+    assert "unanswered=0" in caplog.records[-1].getMessage()
+
+
 def test_an_unconfigured_client_makes_no_call(monkeypatch):
     def boom(timeout_s):
         raise RuntimeError("Vertex AI is not configured")

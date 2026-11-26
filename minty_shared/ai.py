@@ -374,6 +374,9 @@ class ProviderReply:
     reason: str | None = None
     usage: dict[str, int | None] = dataclass_field(default_factory=dict)
     request_id: str | None = None
+    #: Calls sent that got no reply (an error or a timeout, the retry included). Google may bill
+    #: one it processed, but no reply means no token count - each is logged by ``call_model``.
+    unanswered: int = 0
 
 
 class Provider(Protocol):
@@ -420,15 +423,19 @@ class GeminiProvider:
             # Cloud Billing's cost per environment, feature and company (Vertex AI only)
             labels=parts.labels,
         )
+        unanswered: list[dict[str, Any]] = []
         response, reason = call_model(
             lambda: client.models.generate_content(model=model, contents=contents, config=settings),
             model,
             config,
+            unanswered=unanswered,
         )
         if response is None:
-            return ProviderReply(reason=reason)
+            return ProviderReply(reason=reason, unanswered=len(unanswered))
         reply = ProviderReply(
-            usage=_gemini_usage(response), request_id=getattr(response, "response_id", None)
+            usage=_gemini_usage(response),
+            request_id=getattr(response, "response_id", None),
+            unanswered=len(unanswered),
         )
         blocked = _name(getattr(getattr(response, "prompt_feedback", None), "block_reason", None))
         if blocked:
@@ -661,9 +668,13 @@ def _attempt(
         return _attempted(audit, model, Extraction(reason=REASON_NOT_CONFIGURED, audit=audit))
     reply = provider.call(bare, parts, config)
     _add_usage(audit, model, reply, config)
+    lost = reply.unanswered
     if reply.reason or reply.text is None:
         return _attempted(
-            audit, model, Extraction(reason=reply.reason or REASON_INVALID_REPLY, audit=audit)
+            audit,
+            model,
+            Extraction(reason=reply.reason or REASON_INVALID_REPLY, audit=audit),
+            lost,
         )
     try:
         parsed = reply_model.model_validate_json(reply.text)
@@ -675,10 +686,10 @@ def _attempt(
             config.label,
             [e.get("loc") for e in exc.errors()][:6],
         )
-        return _attempted(audit, model, Extraction(reason=REASON_INVALID_REPLY, audit=audit))
+        return _attempted(audit, model, Extraction(reason=REASON_INVALID_REPLY, audit=audit), lost)
     except Exception as exc:  # noqa: BLE001
         logger.warning("%s: reply was not JSON: %s", config.label, type(exc).__name__)
-        return _attempted(audit, model, Extraction(reason=REASON_INVALID_REPLY, audit=audit))
+        return _attempted(audit, model, Extraction(reason=REASON_INVALID_REPLY, audit=audit), lost)
 
     audit["model_answered"] = model
     suggestions = validate(parsed)
@@ -691,12 +702,17 @@ def _attempt(
         result = Extraction(suggestions=suggestions, reason=REASON_NO_USABLE_FIELD, audit=audit)
     else:
         result = Extraction(suggestions=suggestions, audit=audit)
-    return _attempted(audit, model, result)
+    return _attempted(audit, model, result, lost)
 
 
-def _attempted(audit: dict[str, Any], model: str, result: Extraction) -> Extraction:
+def _attempted(
+    audit: dict[str, Any], model: str, result: Extraction, unanswered: int = 0
+) -> Extraction:
+    """Grow the chain: ``model:outcome``, plus ``(N unanswered)`` when calls sent for this model
+    got no reply - possibly billed by Google, never counted in the tokens."""
     outcome = "ok" if audit.get("model_answered") == model else (result.reason or "failed")
-    audit["attempts"].append(f"{model}:{outcome}")
+    lost = f"({unanswered} unanswered)" if unanswered else ""
+    audit["attempts"].append(f"{model}:{outcome}{lost}")
     return result
 
 
@@ -707,6 +723,8 @@ def _add_usage(
     ``model`` is the policy's name for it, the key of ``config.prices``."""
     if reply.request_id:
         audit["provider_request_id"] = reply.request_id
+    if reply.unanswered:
+        audit["calls_unanswered"] = int(audit.get("calls_unanswered") or 0) + reply.unanswered
     usage = reply.usage
     if not usage:
         return
@@ -740,8 +758,8 @@ def log_read(
     status = "ok" if result.suggestions and not result.reason else "no_suggestion"
     logger.info(
         "%s: extract entity=%s user=%s model=%s attempts=%s location=%s latency_ms=%s "
-        "tokens_in=%s tokens_out=%s thought=%s cached=%s cost=%s status=%s reason=%s "
-        "confidence=%s",
+        "tokens_in=%s tokens_out=%s thought=%s cached=%s cost=%s unanswered=%s status=%s "
+        "reason=%s confidence=%s",
         config.label,
         entity_id,
         user_id,
@@ -754,6 +772,7 @@ def log_read(
         a.get("thought_tokens"),
         a.get("cached_tokens"),
         a.get("estimated_cost"),
+        a.get("calls_unanswered") or 0,
         status,
         result.reason,
         a.get("confidence_by_field", {}),
@@ -786,16 +805,66 @@ def _advised_delay(exc: BaseException) -> float | None:
     return float(match.group(1)) if match else None
 
 
-def call_model(send: Callable[[], Any], model: str, config: ReaderConfig) -> tuple[Any, str | None]:
+#: Response headers that may carry the provider's id for a request that failed (looked up in order).
+_REQUEST_ID_HEADERS = ("x-request-id", "x-goog-request-id", "request-id")
+
+
+def _error_request_id(exc: BaseException) -> str | None:
+    """The provider's request id from a failed call's HTTP response, when it sent one - a timeout
+    or a dropped connection has no response, so none."""
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    if not headers:
+        return None
+    for name in _REQUEST_ID_HEADERS:
+        try:
+            value = headers.get(name)
+        except Exception:  # noqa: BLE001 - a header object we do not know: no id
+            return None
+        if value:
+            return str(value)[:200]
+    return None
+
+
+def call_model(
+    send: Callable[[], Any],
+    model: str,
+    config: ReaderConfig,
+    unanswered: list[dict[str, Any]] | None = None,
+) -> tuple[Any, str | None]:
     """One call and at most one retry - only for the retryable classes, most specific first:
     a timeout has spent the budget (no retry); a 429 retries once only if the provider's advised
-    wait fits the deadline; 401/403/404 and other 4xx never; 5xx and transport errors once."""
+    wait fits the deadline; 401/403/404 and other 4xx never; 5xx and transport errors once.
+
+    Every call that raised is appended to ``unanswered`` and logged on one line (model, which call,
+    status, how long it ran, the provider's request id when its error carried one): Google may
+    have processed - and billed - it, yet with no reply its tokens are unknown, so this line is
+    what reconciles Minty's records with Google's billing."""
     deadline = time.monotonic() + config.timeout_seconds
     for attempt in (1, 2):
+        sent = time.monotonic()
         try:
             return send(), None
         except Exception as exc:  # noqa: BLE001 - classified below by status
             status = _error_status(exc)
+            record = {
+                "model": model,
+                "call": attempt,
+                "status": status if status is not None else type(exc).__name__,
+                "elapsed_ms": int((time.monotonic() - sent) * 1000),
+                "request_id": _error_request_id(exc),
+            }
+            if unanswered is not None:
+                unanswered.append(record)
+            logger.warning(
+                "%s: call not answered - model=%s call=%s status=%s elapsed_ms=%s request_id=%s "
+                "(Google may bill it; its tokens are unknown)",
+                config.label,
+                record["model"],
+                record["call"],
+                record["status"],
+                record["elapsed_ms"],
+                record["request_id"],
+            )
             if _is_timeout(exc):
                 logger.warning("%s: timed out after %ss", config.label, config.timeout_seconds)
                 return None, REASON_TIMEOUT
