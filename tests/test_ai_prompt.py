@@ -147,6 +147,14 @@ def test_build_returns_instruction_context_and_aliases():
     assert aliases.account("acc_01") == "404"
 
 
+def test_aliases_list_the_account_ids_sent_in_the_list_s_order():
+    _, _, aliases = ai_prompt.build(
+        "receipt", ENTITY, [("k2", "6000_01_09", "Logistics"), ("k1", "425", "Freight")], []
+    )
+    assert aliases.account_ids == ["acc_01", "acc_02"]
+    assert [aliases.account(i) for i in aliases.account_ids] == ["k1", "k2"]
+
+
 def test_the_reply_schema_gemini_gets_has_every_field_required():
     schema = ai.response_schema(ai_prompt.reply_model("invoice"))
     assert schema["required"] == sorted(ai_prompt.InvoiceReading.model_fields)

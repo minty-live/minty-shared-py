@@ -49,7 +49,7 @@ import random
 import re
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from typing import Any, Protocol
@@ -235,14 +235,26 @@ def reset_client() -> None:
 # --------------------------------------------------------------------------- the reply's shape
 
 
-def response_schema(model: type[BaseModel]) -> dict[str, Any]:
+def response_schema(
+    model: type[BaseModel], choices: Mapping[str, Sequence[str]] | None = None
+) -> dict[str, Any]:
     """A flat Pydantic model as a schema Gemini accepts: no ``title``/``default`` on properties,
-    and every field required so the model answers each one instead of omitting the hard ones."""
+    and every field required so the model answers each one instead of omitting the hard ones.
+
+    ``choices`` holds a field to the values given (an ``enum``; the user, 2026-11-26: a company's
+    account code such as ``6000_01_09`` came back in place of its short id and was dropped, and an
+    account came back empty); an empty list leaves the field free. A field the model lacks is a
+    ValueError - a programming error."""
     schema = model.model_json_schema()
     properties = schema.get("properties", {})
     for prop in properties.values():
         prop.pop("title", None)
         prop.pop("default", None)
+    for field, values in (choices or {}).items():
+        if field not in properties:
+            raise ValueError(f"choices name {field!r}, which the reply model has no field for")
+        if values:
+            properties[field]["enum"] = list(values)
     return {"type": "object", "properties": properties, "required": sorted(properties)}
 
 
@@ -590,6 +602,7 @@ def read(
     validate: Callable[[Any], dict[str, Any]],
     models: Sequence[str] | None = None,
     labels: dict[str, str],
+    choices: Mapping[str, Sequence[str]] | None = None,
 ) -> Extraction:
     """Read one prepared document. Never raises, except ValueError for ``labels`` that are not
     ``request_labels``' three - a programming error, refused before any call.
@@ -607,6 +620,9 @@ def read(
     id only if it was in the lists sent - the reply is untrusted input, and a value that fails a
     check is dropped, never repaired."""
     _check_labels(labels)
+    # ``choices`` (field -> the values it may take, e.g. the account short ids sent) is checked
+    # here too, so a wrong field name is refused before any call
+    schema = response_schema(reply_model, choices)
     started = time.monotonic()
     chain: list[str] = []
     for model in models or []:
@@ -627,7 +643,7 @@ def read(
         mime=mime,
         closing_text=closing_text,
         instruction=instruction,
-        schema=response_schema(reply_model),
+        schema=schema,
         labels=dict(labels),
     )
     result = Extraction(reason=REASON_NOT_CONFIGURED, audit=audit)

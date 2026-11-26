@@ -112,6 +112,12 @@ class Aliases:
     accounts: Mapping[str, str]
     suppliers: Mapping[str, str]
 
+    @property
+    def account_ids(self) -> list[str]:
+        """The account short ids sent, in the list's order - ``read``'s ``choices`` for
+        ``account_id``, so the model can answer nothing else (the user, 2026-11-26)."""
+        return list(self.accounts)
+
     def account(self, short_id: object) -> str | None:
         return self.accounts.get(_short(short_id))
 

@@ -104,7 +104,14 @@ def _settings(monkeypatch):
     ai.reset_client()
 
 
-def _run(monkeypatch, result, config=CONFIG, document=b"%PDF-1.4 fake", mime="application/pdf"):
+def _run(
+    monkeypatch,
+    result,
+    config=CONFIG,
+    document=b"%PDF-1.4 fake",
+    mime="application/pdf",
+    choices=None,
+):
     client = FakeClient(result)
     monkeypatch.setattr(ai, "get_client", lambda timeout_s: client)
     extraction = ai.read(
@@ -118,6 +125,7 @@ def _run(monkeypatch, result, config=CONFIG, document=b"%PDF-1.4 fake", mime="ap
         validate=_validate,
         models=MODELS,
         labels=LABELS,
+        choices=choices,
     )
     return extraction, client
 
@@ -165,6 +173,43 @@ def test_the_reply_is_json_to_a_schema_that_requires_every_field_and_carries_no_
     schema = config.response_json_schema
     assert schema["required"] == sorted(Reply.model_fields)
     assert all("title" not in p and "default" not in p for p in schema["properties"].values())
+
+
+def test_a_field_with_choices_can_only_be_answered_with_one_of_them(monkeypatch):
+    # the user, 2026-11-26: an account code like 6000_01_09 came back in place of its short id
+    # and was dropped - the schema now holds the field to the ids sent
+    _, client = _run(
+        monkeypatch, FakeResponse(_reply()), choices={"contact_id": ["con-sf", "con-x"]}
+    )
+    schema = client.models.last_request["config"].response_json_schema
+    assert schema["properties"]["contact_id"]["enum"] == ["con-sf", "con-x"]
+    assert "enum" not in schema["properties"]["amount_value"]
+
+
+def test_an_empty_list_of_choices_leaves_the_field_free(monkeypatch):
+    _, client = _run(monkeypatch, FakeResponse(_reply()), choices={"contact_id": []})
+    schema = client.models.last_request["config"].response_json_schema
+    assert "enum" not in schema["properties"]["contact_id"]
+
+
+def test_choices_for_a_field_the_reply_lacks_are_refused_before_any_call(monkeypatch):
+    client = FakeClient(FakeResponse(_reply()))
+    monkeypatch.setattr(ai, "get_client", lambda timeout_s: client)
+    with pytest.raises(ValueError):
+        ai.read(
+            b"%PDF-1.4 fake",
+            "application/pdf",
+            config=CONFIG,
+            instruction="Read it.",
+            prefix_text="## Lists",
+            closing_text="Go.",
+            reply_model=Reply,
+            validate=_validate,
+            models=MODELS,
+            labels=LABELS,
+            choices={"account_id": ["acc_01"]},
+        )
+    assert client.models.calls == 0
 
 
 def test_an_image_is_sent_with_its_own_type(monkeypatch):
