@@ -48,9 +48,14 @@ def test_invoice_instruction_is_the_same_text_plus_the_slip_line_and_the_due_dat
     text = ai_prompt.instruction("invoice")
     receipt_fields = RECEIPT_INSTRUCTION.split("\n\nAnswer only")[0]
     assert text.startswith(receipt_fields + "\n" + INVOICE_SLIP_LINE + "- due_date:")
+    # the user, 2026-11-27: the model reports what is printed; the API works out the dates
     assert (
-        "- due_date: ISO 8601 date (YYYY-MM-DD); if only terms such as Net 30 are printed, add "
-        'them to the invoice date; "" if none.\n\nAnswer only with JSON:' in text
+        "- due_date: the due date printed on the document, ISO 8601 (YYYY-MM-DD); never work one "
+        'out; "" if none is printed.\n'
+        "- period_end: if the document is for a period (such as a utility or phone bill), the "
+        'last day of that period, ISO 8601 (YYYY-MM-DD); "" if none.\n'
+        "- payment_terms_days: the number of days in payment terms such as Net 30 or within 14 "
+        "days, as a number only; 0 if none.\n\nAnswer only with JSON:" in text
     )
     template = json.loads(text.rsplit("\n", 1)[1])
     assert list(template) == [
@@ -65,6 +70,8 @@ def test_invoice_instruction_is_the_same_text_plus_the_slip_line_and_the_due_dat
         "document_count",
         "document_type",
         "due_date",
+        "period_end",
+        "payment_terms_days",
     ]
 
 

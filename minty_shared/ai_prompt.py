@@ -1,8 +1,8 @@
 """The simple prompt both document readers send (owner, 2026-11-20). Extra ``ai``.
 
 One builder for minty-petty-cash-api's receipts and minty-payment-request-api's invoices, in the
-owner's words: seven fields (an invoice adds ``due_date``), the company's facts, its chart of
-accounts and its suppliers, and "answer only with JSON". There is no confidence: every answered
+owner's words: seven fields (an invoice adds ``due_date``, ``period_end`` and
+``payment_terms_days``), the company's facts, its chart of accounts and its suppliers, and "answer only with JSON". There is no confidence: every answered
 field is filled and marked for the person to check (``minty_shared.ai.checked``).
 
 The lists carry SHORT ids (``acc_01``, ``con_01``) instead of the caller's keys (UUIDs, Xero ids,
@@ -59,9 +59,15 @@ _INVOICE_SLIP = (
     "terminal merchant or customer copy) that shows a payment was made but lists no goods or "
     "services.\n"
 )
+# the user, 2026-11-27: the model reports what is printed - a due date, a period's last day, the
+# terms' days - and minty-payment-request-api works out the bill's dates from them
 _DUE_DATE = (
-    "- due_date: ISO 8601 date (YYYY-MM-DD); if only terms such as Net 30 are printed, add them "
-    'to the invoice date; "" if none.\n'
+    "- due_date: the due date printed on the document, ISO 8601 (YYYY-MM-DD); never work one "
+    'out; "" if none is printed.\n'
+    "- period_end: if the document is for a period (such as a utility or phone bill), the last "
+    'day of that period, ISO 8601 (YYYY-MM-DD); "" if none.\n'
+    "- payment_terms_days: the number of days in payment terms such as Net 30 or within 14 days, "
+    "as a number only; 0 if none.\n"
 )
 _JSON = (
     '{"supplier_contact_id":"","supplier_name":"","account_id":"","amount":0,"currency":"",'
@@ -86,9 +92,12 @@ class SimpleReading(BaseModel):
 
 
 class InvoiceReading(SimpleReading):
-    """An invoice's answer: a receipt's, plus the due date."""
+    """An invoice's answer: a receipt's, plus the printed due date, a period's last day and the
+    payment terms' days (the user, 2026-11-27)."""
 
     due_date: str = ""
+    period_end: str = ""
+    payment_terms_days: int = 0
 
 
 def reply_model(kind: str) -> type[SimpleReading]:
@@ -101,7 +110,11 @@ def instruction(kind: str) -> str:
     confirmation is (a card slip included) and the due date, to the field list and to the JSON."""
     _check(kind)
     fields = _INSTRUCTION + (_INVOICE_SLIP + _DUE_DATE if kind == INVOICE else "")
-    answer = _JSON + (',"due_date":""' if kind == INVOICE else "") + "}"
+    answer = (
+        _JSON
+        + (',"due_date":"","period_end":"","payment_terms_days":0' if kind == INVOICE else "")
+        + "}"
+    )
     return f"{fields}\nAnswer only with JSON:\n{answer}"
 
 
