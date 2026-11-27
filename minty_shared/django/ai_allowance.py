@@ -8,21 +8,34 @@ UPDATE (or a command), never a release.
 ``timeout_s``, ``max_output_tokens``, ``thinking_level`` and ``max_file_mb`` (no region: every read
 is on Vertex's global endpoint, owner 2026-11-23), which ``Policy.reader`` turns into the ``minty_shared.ai.ReaderConfig`` a read uses - each model's price
 (``model_prices``, the user 2026-11-24: ``{"<model>": {"input": n, "output": n, "cached_input": n}}``,
-USD per 1M tokens; every model the policy names must have one, else reading is OFF) - and two
-allowance settings:
+USD per 1M tokens; every model the policy names must have one, else reading is OFF) - and the
+allowance settings. AI is its own product on the subscription (the user, 2026-11-27):
 
-* ``default_grant`` - the one-time grant every company is given on its first read: ``{"tokens": n,
-  "reads": n, "days": n}``, each key optional (at least ``tokens`` or ``reads``; ``days`` = it
-  expires that many days after it is given). NULL = no automatic grant: only grants given by hand.
-  It is given ONCE per company, ever (``uq_ai_grant_one_default``), so a used-up company stays used
-  up until someone gives it another grant. The preview's is ``{"tokens": 20000}``.
+* ``default_grant`` - the company's AI TRIAL (``source='trial'``, once per company, ever:
+  ``uq_ai_grant_one_trial``): ``{"tokens": n, "reads": n, "days": n}``, each key optional (at least
+  ``tokens`` or ``reads``; ``days`` = how long the trial runs). It starts with the company's first
+  module subscription (its trial, or a purchase without one) - every company that existed on
+  2026-11-27 was given one from that day instead (minty-db's ``2026-11-27_ai_trial_reset.sql``) -
+  and is written at the first read inside that window. NULL = no trial. Live: 280,000 tokens,
+  30 days.
+* ``cycle_tokens`` - after the trial, one grant per billing period of the company's subscription
+  (``source='cycle'``): the period from the payer's anchor (``minty_shared.periods``, billing's own
+  arithmetic), expiring at the period's end, no rollover. The first one is prorated like billing
+  (elapsed seconds, half away from zero) from the trial's end or the company's first charge when
+  either falls inside the period. Only while some module is paid for and its access stands
+  (subscription-api's ``access_end``: ``app_access_until``, else ``paid_through``, plus the past-due
+  window when past due). NULL = no period grants.
 * ``limit_rules`` - extra caps over every company that ALL apply: ``{"reads": n, "tokens": n,
   "period_days": n}``, each key optional; no ``period_days`` = the company's whole life, otherwise
-  a rolling window (a daily throttle, say). The preview has none.
+  a rolling window (a daily throttle, say). Live: none.
 
 ``ai_grant`` is one allowance given to one company (``tokens_total`` and/or ``reads_total``, an
-optional ``expires_at``); a top-up is another grant. ``ai_read`` has one row per read a person asks
-for, CHARGED TO ONE GRANT - the oldest live one with room. ``reserve`` writes it ``pending`` before
+optional ``expires_at``): the trial, a period's grant, a top-up given by hand (``manual``), or the
+one-time ``default`` grant every company got before 2026-11-27. ``ai_read`` has one row per read a
+person asks for, CHARGED TO ONE GRANT - the live one with room that expires soonest (no expiry
+last, then the oldest), so a top-up carries over. The trial and period grants are given at the
+read, under the lock, never by a scheduler; until then ``status`` counts them as due, so a page
+is right before the first read. ``reserve`` writes the read ``pending`` before
 the model is called, under a per-company lock (two clicks with room for one: one passes), and
 ``finish`` marks it ``ok`` (a model answered with a valid reply) or ``failed``. What counts against
 a grant (and a rule):
@@ -39,8 +52,11 @@ disabled button with the reason.
 
 FAIL CLOSED: no policy row, or one that does not parse, logs an error and turns reading off; it
 never falls back to a guessed limit. The models come through ``django.apps`` by name
-(``minty_db.AiPolicy``, ``.AiGrant``, ``.AiRead``), so this module needs ``minty_db`` installed in
-the service but does not import it. Extra ``django``.
+(``minty_db.AiPolicy``, ``.AiGrant``, ``.AiRead``, and the subscription's
+``.EntityModuleSubscription``, ``.UserStripeCustomer``, ``.EntityBillingGroup``,
+``.SubscriptionTransfer``, ``.BillingPolicy`` - read only, the same rows subscription-api decides
+access from), so this module needs ``minty_db`` installed in the service but does not import it.
+Extra ``django``.
 """
 
 from __future__ import annotations
@@ -49,7 +65,7 @@ import logging
 import math
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -59,8 +75,19 @@ from django.db.models import Count, F, Min, Q, Sum
 from django.utils import timezone
 
 from minty_shared import ai
+from minty_shared.periods import period_containing, prorate
 
 logger = logging.getLogger("minty-shared.ai")
+
+#: ``ai_grant.source``: the AI trial, a billing period's grant, a top-up by hand, and the one-time
+#: grant before 2026-11-27.
+SOURCE_TRIAL = "trial"
+SOURCE_CYCLE = "cycle"
+SOURCE_MANUAL = "manual"
+SOURCE_DEFAULT = "default"
+
+#: Who the automatic grants are given by (``ai_grant.granted_by``).
+GRANTED_BY_POLICY = "ai_policy"
 
 MODULE_PETTY_CASH = "petty_cash"
 MODULE_PAYMENT_REQUEST = "payment_request"
@@ -127,6 +154,7 @@ class Policy:
     default_grant: GrantSpec | None = None
     settings: ReaderSettings = ReaderSettings()
     prices: tuple[tuple[str, ai.ModelPrice], ...] = ()
+    cycle_tokens: int | None = None
 
     @property
     def models(self) -> list[str]:
@@ -160,7 +188,8 @@ class RuleUsage:
 
 @dataclass(frozen=True)
 class GrantUsage:
-    """One grant and what has been charged to it. ``id`` None = the default grant not given yet."""
+    """One grant and what has been charged to it. ``id`` None = a grant due but not given yet (the
+    trial or this period's, given at the next read)."""
 
     id: Any
     tokens_total: int | None
@@ -168,6 +197,8 @@ class GrantUsage:
     expires_at: datetime | None = None
     tokens_used: int = 0
     reads_used: int = 0
+    source: str = SOURCE_MANUAL
+    created_at: datetime | None = None
 
     def live(self, now: datetime) -> bool:
         return self.expires_at is None or self.expires_at > now
@@ -185,8 +216,9 @@ class Allowance:
     """Where a company stands. ``percent_left`` is how much of its open grants (live, with room) is
     left (by tokens when they have token caps, else by reads); ``reads_limit``/``reads_left`` come
     from read caps (the tightest rule, else the open grants), None when nothing counts reads. ``blocked`` = no
-    live grant has room, or a rule is used up; ``resumes_at`` is when the rules blocking it next
-    have room (None = not blocked, or blocked until a new grant is given)."""
+    live grant has room, or a rule is used up; ``resumes_at`` is when reading comes back by itself
+    - the rules' windows moving, the next billing period's grant, or the trial handing over to the
+    period grants - (None = not blocked, or blocked until someone gives a grant)."""
 
     reads_used: int | None
     reads_limit: int | None
@@ -204,6 +236,150 @@ class Allowance:
             "blocked": self.blocked,
             "resumes_at": self.resumes_at.isoformat() if self.resumes_at else None,
         }
+
+
+# --------------------------------------------------------------------------- the subscription
+
+#: ``entity_module_subscription.phase`` values the allowance reads (subscription-api's).
+PHASE_ACTIVE = "active"
+PHASE_PAST_DUE = "past_due"
+PHASE_SCHEDULED_CANCEL = "scheduled_cancel"
+
+
+@dataclass(frozen=True)
+class ModuleTerm:
+    """One module's subscription row (``entity_module_subscription``), the parts that matter here."""
+
+    phase: str
+    created_at: datetime
+    trial_end: datetime | None = None
+    app_access_until: datetime | None = None
+    first_billed_at: datetime | None = None
+
+    @property
+    def paying(self) -> bool:
+        """Billed - not a trial, not finished: subscription-api's ``is_paid_module``."""
+        return self.phase in (PHASE_ACTIVE, PHASE_PAST_DUE) or (
+            self.phase == PHASE_SCHEDULED_CANCEL and self.first_billed_at is not None
+        )
+
+
+@dataclass(frozen=True)
+class Subscription:
+    """What a company's subscription says about its periods: its module rows, the payer's anchor
+    (every period is derived from it), and what the company is paid through (its billing
+    account's ``paid_through``, or a handover's parked ``collect_at`` when later)."""
+
+    modules: tuple[ModuleTerm, ...] = ()
+    anchor_at: datetime | None = None
+    paid_through: datetime | None = None
+    past_due_days: int = 0
+
+    def access_until(self, module: ModuleTerm) -> datetime | None:
+        """When a paid module's access ends: subscription-api's ``access.access_end`` for the
+        paying phases."""
+        if module.app_access_until is not None:
+            return module.app_access_until
+        if self.paid_through is None:
+            return None
+        if module.phase == PHASE_PAST_DUE:
+            return self.paid_through + timedelta(days=self.past_due_days)
+        return self.paid_through
+
+    def paid_access(self) -> tuple[datetime | None, bool]:
+        """``(when the last paid module's access ends, whether one renews by itself)`` - renews =
+        active with no end of its own, so its access moves on at each renewal."""
+        paying = [m for m in self.modules if m.paying]
+        ends = [end for end in (self.access_until(m) for m in paying) if end is not None]
+        renews = any(m.phase == PHASE_ACTIVE and m.app_access_until is None for m in paying)
+        return (max(ends) if ends else None), renews
+
+    @property
+    def first_billed_at(self) -> datetime | None:
+        """The company's first charge, over the modules it pays for."""
+        billed = [m.first_billed_at for m in self.modules if m.paying and m.first_billed_at]
+        return min(billed) if billed else None
+
+
+@dataclass(frozen=True)
+class DueGrant:
+    """A grant the company is due now but has not been given: the trial, or this period's."""
+
+    source: str
+    tokens: int | None
+    reads: int | None
+    expires_at: datetime | None
+
+    def usage(self) -> GrantUsage:
+        return GrantUsage(
+            id=None,
+            tokens_total=self.tokens,
+            reads_total=self.reads,
+            expires_at=self.expires_at,
+            source=self.source,
+        )
+
+
+@dataclass(frozen=True)
+class GrantPlan:
+    """The grants due now, and when the next one comes by itself (None = none will)."""
+
+    due: tuple[DueGrant, ...] = ()
+    next_grant_at: datetime | None = None
+
+
+def plan_grants(
+    grants: list[GrantUsage], subscription: Subscription, policy: Policy, now: datetime
+) -> GrantPlan:
+    """What ``grants`` (the company's, as given) lack now under ``policy``, and when the next
+    automatic grant comes. Pure.
+
+    * The TRIAL: none given yet, ``default_grant`` set and the company has a module row - it runs
+      ``days`` from the first row's ``created_at``; due only inside that window.
+    * A PERIOD'S GRANT: after the trial (or with no trial), ``cycle_tokens`` set, an anchor, and a
+      paid module whose access is still running. One per period - one created inside it counts,
+      ended early or not - prorated from the latest of the period's start, the trial's end and
+      the company's first charge.
+    """
+    trial = next((g for g in grants if g.source == SOURCE_TRIAL), None)
+    due: list[DueGrant] = []
+    has_trial = trial is not None
+    trial_end = trial.expires_at if trial is not None else None
+    spec = policy.default_grant
+    if trial is None and spec is not None and subscription.modules:
+        start = min(m.created_at for m in subscription.modules)
+        end = start + timedelta(days=spec.days) if spec.days else None
+        if end is None or now < end:
+            due.append(DueGrant(SOURCE_TRIAL, spec.tokens, spec.reads, end))
+        has_trial, trial_end = True, end
+
+    next_at = None
+    tokens = policy.cycle_tokens
+    until, renews = subscription.paid_access()
+    if tokens and subscription.anchor_at is not None and until is not None and until > now:
+        if has_trial and (trial_end is None or now < trial_end):
+            # the AI trial runs its full length; the period grants start when it ends
+            if trial_end is not None and (renews or until > trial_end):
+                next_at = trial_end
+        else:
+            period = period_containing(subscription.anchor_at, now)
+            starts = [period.start]
+            if trial_end is not None:
+                starts.append(trial_end)
+            if subscription.first_billed_at is not None:
+                starts.append(subscription.first_billed_at)
+            size = prorate(tokens, period, max(starts))
+            given = any(
+                g.source == SOURCE_CYCLE
+                and g.created_at is not None
+                and period.contains(g.created_at)
+                for g in grants
+            )
+            if size > 0 and not given:
+                due.append(DueGrant(SOURCE_CYCLE, size, None, period.end))
+            if renews or until > period.end:
+                next_at = period.end
+    return GrantPlan(tuple(due), next_at)
 
 
 # --------------------------------------------------------------------------- the policy
@@ -327,6 +503,7 @@ def parse_policy(
     default_grant: Any = None,
     settings: dict[str, Any] | None = None,
     model_prices: Any = None,
+    cycle_tokens: Any = None,
 ) -> Policy:
     if not isinstance(primary_model, str) or not primary_model.strip():
         raise PolicyError("primary_model is empty")
@@ -341,6 +518,7 @@ def parse_policy(
         parse_grant(default_grant),
         parse_settings(settings),
         tuple(parse_prices(model_prices, models).items()),
+        None if cycle_tokens is None else _whole(cycle_tokens, "cycle_tokens", 1),
     )
 
 
@@ -356,6 +534,7 @@ def load_policy() -> Policy | None:
             "limit_rules",
             "default_grant",
             "model_prices",
+            "cycle_tokens",
             *SETTING_FIELDS,
         )
         .first()
@@ -374,6 +553,7 @@ def load_policy() -> Policy | None:
             row["default_grant"],
             {key: row[key] for key in SETTING_FIELDS},
             row["model_prices"],
+            row["cycle_tokens"],
         )
     except PolicyError as exc:
         logger.error("ai: ai_policy is unusable (%s) - AI reading is OFF until it is fixed", exc)
@@ -395,9 +575,12 @@ def summarise(
     usages: list[RuleUsage],
     grants: list[GrantUsage],
     now: datetime,
+    next_grant_at: datetime | None = None,
 ) -> Allowance:
     """The allowance from each rule's usage (``usages[i]`` is ``rules[i]``'s) and the company's
-    grants (the default one not given yet included, as a grant with id None). Pure."""
+    grants (the ones due but not given yet included, with id None). ``next_grant_at`` is when the
+    next automatic grant comes (``GrantPlan``): a company with no grant room reads again then.
+    Pure."""
     blocking: list[tuple[Rule, RuleUsage]] = []
     tightest: tuple[int, int, int] | None = None  # (left, limit, used)
     for rule, used in zip(rules, usages, strict=True):
@@ -432,14 +615,24 @@ def summarise(
         used = sum(g.reads_used for g in by_reads)
         tightest = (max(0, limit - used), limit, used)
 
+    # reading comes back by itself only when everything stopping it does: each blocking rule's
+    # window moving, and - with no grant room - the next automatic grant
+    waits: list[datetime | None] = []
+    if blocking:
+        if all(r.period_days for r, _ in blocking):
+            moments = [
+                u.oldest + timedelta(days=r.period_days)  # type: ignore[arg-type]
+                for r, u in blocking
+                if u.oldest is not None
+            ]
+            waits.append(max(moments) if moments else None)
+        else:
+            waits.append(None)
+    if no_grant_room:
+        waits.append(next_grant_at)
     resumes_at = None
-    if blocking and not no_grant_room and all(r.period_days for r, _ in blocking):
-        moments = [
-            u.oldest + timedelta(days=r.period_days)  # type: ignore[arg-type]
-            for r, u in blocking
-            if u.oldest is not None
-        ]
-        resumes_at = max(moments) if moments else None
+    if waits and all(w is not None for w in waits):
+        resumes_at = max(w for w in waits if w is not None)
     return Allowance(
         reads_used=tightest[2] if tightest else None,
         reads_limit=tightest[1] if tightest else None,
@@ -470,7 +663,8 @@ def _usage(entity_id: Any, period_days: int | None, now: datetime) -> RuleUsage:
 
 
 def grants_of(entity_id: Any, now: datetime | None = None) -> list[GrantUsage]:
-    """The company's grants, oldest first, with what has been charged to each."""
+    """The company's grants, oldest first, with what has been charged to each (``charge_order``
+    picks the one a read uses)."""
     return grants_of_many([entity_id], now).get(str(entity_id), [])
 
 
@@ -484,7 +678,15 @@ def grants_of_many(
         apps.get_model("minty_db", "AiGrant")
         .objects.filter(entity_id__in=list(entity_ids))
         .order_by("created_at", "id")
-        .values("id", "entity_id", "tokens_total", "reads_total", "expires_at")
+        .values(
+            "id",
+            "entity_id",
+            "tokens_total",
+            "reads_total",
+            "expires_at",
+            "source",
+            "created_at",
+        )
     )
     if not rows:
         return {}
@@ -512,41 +714,152 @@ def grants_of_many(
                 expires_at=r["expires_at"],
                 tokens_used=int(used.get("tokens") or 0),
                 reads_used=int(used.get("reads") or 0),
+                source=r["source"],
+                created_at=r["created_at"],
             )
         )
     return out
 
 
+def subscription_of(entity_id: Any) -> Subscription:
+    """``entity_id``'s ``Subscription`` (an empty one when it has no module row)."""
+    return subscriptions_of_many([entity_id]).get(str(entity_id), Subscription())
+
+
+def subscriptions_of_many(entity_ids: list[Any]) -> dict[str, Subscription]:
+    """Several companies' subscriptions at once - at most five queries, whatever the count. Keyed by the
+    company id as text; a company with no module row is absent. Read the way subscription-api
+    reads them: one payer per company (its rows' ``payer_user_id``), the anchor on the payer's
+    ``user_stripe_customer``, ``paid_through`` on the company's billing account for that payer -
+    or a handover's parked ``collect_at`` when later (``store.paid_through_for_entity``)."""
+    ids = [str(e) for e in entity_ids]
+    rows = list(
+        apps.get_model("minty_db", "EntityModuleSubscription")
+        .objects.filter(entity_id__in=ids)
+        .values(
+            "entity_id",
+            "phase",
+            "created_at",
+            "trial_end",
+            "app_access_until",
+            "first_billed_at",
+            "payer_user_id",
+        )
+    )
+    if not rows:
+        return {}
+    modules: dict[str, list[ModuleTerm]] = {}
+    payer: dict[str, Any] = {}
+    for r in rows:
+        key = str(r["entity_id"])
+        modules.setdefault(key, []).append(
+            ModuleTerm(
+                phase=str(r["phase"]),
+                created_at=r["created_at"],
+                trial_end=r["trial_end"],
+                app_access_until=r["app_access_until"],
+                first_billed_at=r["first_billed_at"],
+            )
+        )
+        if r["payer_user_id"] is not None:
+            payer[key] = r["payer_user_id"]
+    payers = set(payer.values())
+    anchors: dict[str, datetime | None] = {}
+    paid: dict[str, datetime | None] = {}
+    if payers:
+        anchors = {
+            str(user): anchor
+            for user, anchor in apps.get_model("minty_db", "UserStripeCustomer")
+            .objects.filter(user_id__in=payers)
+            .values_list("user_id", "anchor_at")
+        }
+        for entity, user, through in (
+            apps.get_model("minty_db", "EntityBillingGroup")
+            .objects.filter(entity_id__in=list(payer), payer_user_id__in=payers)
+            .values_list("entity_id", "payer_user_id", "billing_group__paid_through")
+        ):
+            if payer.get(str(entity)) == user:
+                paid[str(entity)] = through
+        for entity, user, collect in (
+            apps.get_model("minty_db", "SubscriptionTransfer")
+            .objects.filter(
+                entity_id__in=list(payer), to_user_id__in=payers, collect_at__isnull=False
+            )
+            .values_list("entity_id", "to_user_id", "collect_at")
+        ):
+            key = str(entity)
+            if payer.get(key) == user and (paid.get(key) is None or collect > paid[key]):
+                paid[key] = collect
+    window = 0
+    if any(t.phase == PHASE_PAST_DUE for terms in modules.values() for t in terms):
+        # only a past-due module's access needs the window (subscription-api's past_due_window_days)
+        found = (
+            apps.get_model("minty_db", "BillingPolicy")
+            .objects.filter(id=1)
+            .values_list("past_due_window_days", flat=True)
+            .first()
+        )
+        if found is None:
+            logger.error(
+                "ai: billing_policy has no row - a past-due company gets no AI grace "
+                "(seed_catalogue.sql)"
+            )
+        window = int(found or 0)
+    return {
+        key: Subscription(
+            modules=tuple(terms),
+            anchor_at=anchors.get(str(payer[key])) if key in payer else None,
+            paid_through=paid.get(key),
+            past_due_days=int(window),
+        )
+        for key, terms in modules.items()
+    }
+
+
+def charge_order(grant: GrantUsage) -> tuple[bool, datetime]:
+    """The order a read picks among grants with room: the soonest to expire first, no expiry last
+    (``min`` keeps the oldest among equals: ``grants_of`` lists oldest first)."""
+    return grant.expires_at is None, grant.expires_at or datetime.max.replace(tzinfo=UTC)
+
+
+def with_due(
+    grants: list[GrantUsage], policy: Policy, subscription: Subscription, now: datetime
+) -> tuple[list[GrantUsage], GrantPlan]:
+    """``grants`` and the grants due now but not given yet (counted as if given: the next read
+    gives them), with the plan they came from."""
+    plan = plan_grants(grants, subscription, policy, now)
+    return grants + [d.usage() for d in plan.due], plan
+
+
 def grant_allowance(
-    grants: list[GrantUsage], policy: Policy, now: datetime | None = None
+    grants: list[GrantUsage],
+    policy: Policy,
+    subscription: Subscription,
+    now: datetime | None = None,
 ) -> Allowance:
     """Where a company stands on its grants alone (no extra caps) - the superuser list's figure,
-    from ``grants_of_many``. A company never given anything shows the default it will get."""
+    from ``grants_of_many`` and ``subscriptions_of_many``. A grant due but not given yet counts."""
     now = now or timezone.now()
-    return summarise((), [], with_default(grants, policy, now), now)
-
-
-def with_default(grants: list[GrantUsage], policy: Policy, now: datetime) -> list[GrantUsage]:
-    """A company never given anything counts the default grant it WILL get on its first read."""
-    spec = policy.default_grant
-    if grants or spec is None:
-        return grants
-    expires = now + timedelta(days=spec.days) if spec.days else None
-    return [
-        GrantUsage(id=None, tokens_total=spec.tokens, reads_total=spec.reads, expires_at=expires)
-    ]
+    counted, plan = with_due(grants, policy, subscription, now)
+    return summarise((), [], counted, now, plan.next_grant_at)
 
 
 def status(entity_id: Any, policy: Policy) -> Allowance:
-    """Where ``entity_id`` stands now under ``policy``: its grants, and one query per distinct
-    rule window."""
+    """Where ``entity_id`` stands now under ``policy``: its grants (the ones due counted), its
+    subscription, and one query per distinct rule window."""
     now = timezone.now()
     by_period: dict[int | None, RuleUsage] = {}
     for rule in policy.rules:
         if rule.period_days not in by_period:
             by_period[rule.period_days] = _usage(entity_id, rule.period_days, now)
-    grants = with_default(grants_of(entity_id, now), policy, now)
-    return summarise(policy.rules, [by_period[r.period_days] for r in policy.rules], grants, now)
+    counted, plan = with_due(grants_of(entity_id, now), policy, subscription_of(entity_id), now)
+    return summarise(
+        policy.rules,
+        [by_period[r.period_days] for r in policy.rules],
+        counted,
+        now,
+        plan.next_grant_at,
+    )
 
 
 def reader_status(reader: str, entity_id: Any, user_id: Any = None) -> dict[str, Any]:
@@ -617,21 +930,30 @@ def reserve(
     entity_id: Any, user_id: Any, module: str, policy: Policy
 ) -> tuple[uuid.UUID | None, Allowance]:
     """Hold one read for ``entity_id`` before the model is called: ``(read id, allowance after
-    it)``, or ``(None, allowance)`` when no grant has room or a rule is used up. A company's first
-    read gives it the default grant. Serialised per company (a Postgres advisory lock, held to the
-    end of the transaction), across both services."""
+    it)``, or ``(None, allowance)`` when no grant has room or a rule is used up. The grants due now
+    (the AI trial, this period's) are given first. Serialised per company (a Postgres advisory
+    lock, held to the end of the transaction), across both services."""
     if module not in MODULES:
         raise ValueError(f"unknown module {module!r}")
     read_model = apps.get_model("minty_db", "AiRead")
+    grant_model = apps.get_model("minty_db", "AiGrant")
     with transaction.atomic():  # pyright: ignore[reportGeneralTypeIssues] - Django has no stubs
         _lock(entity_id)
         now = timezone.now()
-        if policy.default_grant and not grants_of(entity_id, now):
-            give_grant(entity_id, policy.default_grant, granted_by="ai_policy", source="default")
+        plan = plan_grants(grants_of(entity_id, now), subscription_of(entity_id), policy, now)
+        for due in plan.due:
+            grant_model.objects.create(
+                entity_id=entity_id,
+                tokens_total=due.tokens,
+                reads_total=due.reads,
+                expires_at=due.expires_at,
+                source=due.source,
+                granted_by=GRANTED_BY_POLICY,
+            )
         before = status(entity_id, policy)
         if before.blocked:
             return None, before
-        charge = next(g for g in grants_of(entity_id, now) if g.has_room(now))
+        charge = min((g for g in grants_of(entity_id, now) if g.has_room(now)), key=charge_order)
         row = read_model.objects.create(
             entity_id=entity_id,
             grant_id=charge.id,

@@ -10,14 +10,22 @@ from minty_shared import ai
 from minty_shared.django.ai_allowance import (
     READER_INVOICE,
     READER_RECEIPT,
+    SOURCE_CYCLE,
+    SOURCE_MANUAL,
+    SOURCE_TRIAL,
     GrantSpec,
     GrantUsage,
+    ModuleTerm,
+    Policy,
     PolicyError,
     Rule,
     RuleUsage,
+    Subscription,
+    charge_order,
     parse_grant,
     parse_policy,
     parse_rules,
+    plan_grants,
     summarise,
 )
 
@@ -342,3 +350,182 @@ def test_the_page_gets_iso_times_and_the_percent():
     allowance = summarise((rule,), [RuleUsage(reads=1, oldest=NOW)], [grant(tokens=100)], NOW)
     shown = allowance.as_dict()
     assert shown["resumes_at"] == "2026-11-19T09:00:00+00:00" and shown["percent_left"] == 100
+
+
+# --- the AI trial and the billing periods' grants (the user, 2026-11-27) ---------------------
+
+TRIAL = GrantSpec(tokens=280000, days=30)
+CYCLES = Policy("gemini-3.5-flash-lite", None, (), TRIAL, cycle_tokens=280000)
+ANCHOR = datetime(2026, 10, 1, 4, 0, tzinfo=UTC)  # periods run from the 1st, 04:00 UTC
+PERIOD_END = datetime(2026, 12, 1, 4, 0, tzinfo=UTC)  # the period 1 Nov - 1 Dec
+
+
+def at(month, day):
+    return datetime(2026, month, day, tzinfo=UTC)
+
+
+def given(source, tokens, expires, *, created=NOW - timedelta(days=1), used=0, gid=None):
+    return GrantUsage(
+        id=gid or source,
+        tokens_total=tokens,
+        reads_total=None,
+        expires_at=expires,
+        tokens_used=used,
+        source=source,
+        created_at=created,
+    )
+
+
+#: a trial that ended long ago
+OLD_TRIAL = given(SOURCE_TRIAL, 280000, at(9, 1), created=at(8, 2))
+
+
+def paying(phase="active", *, first_billed=ANCHOR, until=None):
+    return ModuleTerm(
+        phase=phase,
+        created_at=ANCHOR - timedelta(days=30),
+        first_billed_at=first_billed,
+        app_access_until=until,
+    )
+
+
+def subscription(*modules, paid_through=PERIOD_END):
+    return Subscription(
+        modules=modules, anchor_at=ANCHOR, paid_through=paid_through, past_due_days=15
+    )
+
+
+def test_a_new_company_s_ai_trial_starts_with_its_first_module_trial():
+    started = NOW - timedelta(days=4)
+    trialling = Subscription(
+        modules=(
+            ModuleTerm(phase="trial", created_at=started, trial_end=started + timedelta(days=30)),
+        )
+    )
+    plan = plan_grants([], trialling, CYCLES, NOW)
+    assert [(d.source, d.tokens, d.expires_at) for d in plan.due] == [
+        (SOURCE_TRIAL, 280000, started + timedelta(days=30))
+    ]
+    assert plan.next_grant_at is None  # not paying: nothing follows the trial by itself
+
+
+def test_a_trial_window_already_over_gives_no_trial():
+    lapsed = Subscription(
+        modules=(ModuleTerm(phase="expired", created_at=NOW - timedelta(days=45)),)
+    )
+    assert plan_grants([], lapsed, CYCLES, NOW).due == ()
+
+
+def test_the_trial_is_given_once():
+    trial = given(SOURCE_TRIAL, 280000, NOW + timedelta(days=10), used=280000)
+    sub = Subscription(modules=(paying("trial", first_billed=None),))
+    assert plan_grants([trial], sub, CYCLES, NOW).due == ()
+
+
+def test_no_trial_and_no_period_grant_without_a_module():
+    assert plan_grants([], Subscription(), CYCLES, NOW).due == ()
+
+
+def test_no_period_grant_while_the_ai_trial_runs_even_when_paying():
+    trial = given(SOURCE_TRIAL, 280000, NOW + timedelta(days=10))
+    plan = plan_grants([trial], subscription(paying()), CYCLES, NOW)
+    assert plan.due == ()
+    assert plan.next_grant_at == NOW + timedelta(days=10)  # the period grants take over then
+
+
+def test_the_first_period_after_the_trial_is_prorated_like_billing():
+    # the period is 1 Nov - 1 Dec (30 days); the trial ended 12 days in: 18 of 30 days are left
+    trial_end = datetime(2026, 11, 13, 4, 0, tzinfo=UTC)
+    trial = given(SOURCE_TRIAL, 280000, trial_end, created=trial_end - timedelta(days=30))
+    plan = plan_grants([trial], subscription(paying()), CYCLES, at(11, 20))
+    assert [(d.source, d.tokens, d.expires_at) for d in plan.due] == [
+        (SOURCE_CYCLE, 168000, PERIOD_END)
+    ]
+    assert plan.next_grant_at == PERIOD_END
+
+
+def test_a_full_period_gets_the_full_grant_and_one_given_in_it_is_not_given_again():
+    sub = subscription(paying())
+    assert [d.tokens for d in plan_grants([OLD_TRIAL], sub, CYCLES, at(11, 20)).due] == [280000]
+    this_period = given(SOURCE_CYCLE, 280000, PERIOD_END, created=at(11, 3))
+    assert plan_grants([OLD_TRIAL, this_period], sub, CYCLES, at(11, 20)).due == ()
+    ended_early = given(SOURCE_CYCLE, 280000, at(11, 10), created=at(11, 3))
+    assert plan_grants([OLD_TRIAL, ended_early], sub, CYCLES, at(11, 20)).due == ()
+
+
+def test_last_period_s_grant_does_not_count_for_this_one():
+    last = given(SOURCE_CYCLE, 280000, datetime(2026, 11, 1, 4, 0, tzinfo=UTC), created=at(10, 5))
+    plan = plan_grants([OLD_TRIAL, last], subscription(paying()), CYCLES, at(11, 20))
+    assert [d.tokens for d in plan.due] == [280000]
+
+
+def test_a_company_joining_its_payer_s_cycle_mid_period_is_prorated_from_its_first_charge():
+    joined = paying(first_billed=datetime(2026, 11, 16, 4, 0, tzinfo=UTC))  # 15 of 30 days left
+    plan = plan_grants([OLD_TRIAL], subscription(joined), CYCLES, at(11, 20))
+    assert [d.tokens for d in plan.due] == [140000]
+
+
+def test_past_due_keeps_period_grants_through_the_grace_then_none():
+    late = subscription(paying("past_due"), paid_through=datetime(2026, 11, 1, 4, 0, tzinfo=UTC))
+    in_grace = plan_grants([OLD_TRIAL], late, CYCLES, at(11, 10))
+    assert [d.tokens for d in in_grace.due] == [280000]
+    assert in_grace.next_grant_at is None  # no renewal to count on while past due
+    assert plan_grants([OLD_TRIAL], late, CYCLES, at(11, 17)).due == ()  # grace over
+
+
+def test_a_finished_or_unpaid_subscription_gets_no_period_grant():
+    for phase in ("cancelled", "expired", "trial"):
+        assert plan_grants([OLD_TRIAL], subscription(paying(phase)), CYCLES, at(11, 20)).due == ()
+    no_anchor = Subscription(modules=(paying(),), paid_through=PERIOD_END)
+    assert plan_grants([OLD_TRIAL], no_anchor, CYCLES, at(11, 20)).due == ()
+
+
+def test_a_paid_cancellation_keeps_grants_until_its_access_ends():
+    leaving = subscription(paying("scheduled_cancel", until=at(12, 15)))
+    plan = plan_grants([OLD_TRIAL], leaving, CYCLES, at(11, 20))
+    assert [d.tokens for d in plan.due] == [280000]
+    assert plan.next_grant_at == PERIOD_END  # its access runs past the period's end
+    ending = subscription(paying("scheduled_cancel", until=at(11, 25)))
+    assert plan_grants([OLD_TRIAL], ending, CYCLES, at(11, 20)).next_grant_at is None
+
+
+def test_no_cycle_tokens_means_no_period_grants():
+    only_trial = Policy("gemini-3.5-flash-lite", None, (), TRIAL)
+    assert plan_grants([OLD_TRIAL], subscription(paying()), only_trial, at(11, 20)).due == ()
+
+
+def test_a_used_up_period_grant_resumes_at_the_next_period():
+    spent = given(SOURCE_CYCLE, 280000, NOW + timedelta(days=12), used=280000)
+    allowance = summarise((), [], [spent], NOW, next_grant_at=NOW + timedelta(days=12))
+    assert allowance.blocked and allowance.resumes_at == NOW + timedelta(days=12)
+    assert summarise((), [], [spent], NOW).resumes_at is None  # nothing follows: used up for good
+
+
+def test_a_resume_time_waits_for_the_rules_too():
+    rule = Rule(reads=1, period_days=1)
+    allowance = summarise(
+        (rule,),
+        [RuleUsage(reads=1, oldest=NOW)],
+        [given(SOURCE_CYCLE, 10, None, used=10)],
+        NOW,
+        next_grant_at=NOW + timedelta(hours=2),
+    )
+    assert allowance.resumes_at == NOW + timedelta(days=1)  # the later of the two
+
+
+def test_the_grant_expiring_soonest_is_charged_first_and_top_ups_last():
+    top_up = given(SOURCE_MANUAL, 50000, None, created=NOW - timedelta(days=20), gid="top-up")
+    period = given(SOURCE_CYCLE, 280000, NOW + timedelta(days=12), gid="period")
+    trial = given(SOURCE_TRIAL, 280000, NOW + timedelta(days=2), gid="trial")
+    assert min([top_up, period, trial], key=charge_order).id == "trial"
+    assert min([top_up, period], key=charge_order).id == "period"
+    assert min([top_up], key=charge_order).id == "top-up"
+
+
+def test_the_policy_reads_cycle_tokens_and_refuses_nonsense():
+    trial = {"tokens": 280000, "days": 30}
+    policy = parse_policy("gemini-3.5-flash-lite", None, [], trial, None, PRICES, 280000)
+    assert policy.cycle_tokens == 280000 and policy.default_grant == TRIAL
+    assert parse_policy("gemini-3.5-flash-lite", None, [], None, None, PRICES).cycle_tokens is None
+    with pytest.raises(PolicyError):
+        parse_policy("gemini-3.5-flash-lite", None, [], None, None, PRICES, 0)
